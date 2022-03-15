@@ -1,0 +1,54 @@
+#+title: empager
+#+date: <2022-03-15 Tue 11:09>
+#+description: README file for the 'empager' program.
+
+Empager is a pager (like =less= or =more=) whose functionality is provided by
+a specially-configured instance of the Emacs editor.
+
+Below is the formal documentation for =empager=. See the corresponding
+[[https://blog0.steelcandy.org/2022-03-14-paging.html][blog post]] for a more informal and expansive introduction to the program.
+
+#+begin_example
+usage: empager -h
+       empager -k
+       empager [-FgRnN] [-p pat] [-e code]... [-f fn]... [-l src-file]... [[+[line]] [@rev] file]...
+#+end_example
+
+If the '=-h=' option is specified then this message is output to
+standard output and we exit with exit code 0. If the '=-k='
+option is specified then a message summarizing the nonstandard
+keybindings is output to standard output and we exit with exit
+code 0.
+
+Otherwise a new Emacs is started and each '=file=' — as well as
+standard input's content if it isn't a terminal — is opened for
+reading only in a separate buffer, with line number '=line=' (or
+the last line if '=line=' is omitted) the current line for each
+'file' preceded by '+[line]', and with the first line the
+current line for the other '=file=''s. If the '=-p=' option was
+specified then point is then moved to the site of the first
+match for the regular expression '=pat='. For each '=file='
+preceded by '=@rev=' that version control revision of the file
+will be opened instead, if possible. (None, one or both of
+'=@rev=' and '=+[line]=' can be specified for a given '=file=', and
+if both are then they can be specified in either order.)
+
+If a '=file=' is '=-=' then it represents our standard input: the
+current line in its buffer will be determined by any '=+line='
+that immediately precedes it. If no '=file=' is '=-=' and our
+standard input isn't a terminal then we act as though an extra
+'=file=' that is '=-=' had been appended to our invocation (with no
+'=+line=' immediately preceding it).
+
+By default a terminal Emacs is started, but if the '=-g=' option
+is specified then a graphical Emacs is started — if possible —
+instead.
+
+The '=-F=', '=-R=' and '=-N=' options work like the corresponding
+options to the program '=less=', the '=-f=' and '=-l=' options work
+like the corresponding options to the program '=emacs=', and the
+'=-e=' option works like the '=--eval=' option to '=emacs='. The '=-n='
+option exists for compatibility with '=less=', but is ignored since
+it addresses a problem we don't have. Similarly, the '=-i=' and
+'=-I=' options also exist for compatibility with '=less=', but are
+ignored.
