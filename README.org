@@ -24,7 +24,7 @@ Otherwise a new Emacs is started and each '=file=' — as well as
 standard input's content if it isn't a terminal — is opened for
 reading only in a separate buffer, with line number '=line=' (or
 the last line if '=line=' is omitted) the current line for each
-'file' preceded by '+[line]', and with the first line the
+'=file=' preceded by '=+[line]=', and with the first line the
 current line for the other '=file=''s. If the '=-p=' option was
 specified then point is then moved to the site of the first
 match for the regular expression '=pat='. For each '=file='
@@ -47,8 +47,8 @@ instead.
 The '=-F=', '=-R=' and '=-N=' options work like the corresponding
 options to the program '=less=', the '=-f=' and '=-l=' options work
 like the corresponding options to the program '=emacs=', and the
-'=-e=' option works like the '=--eval=' option to '=emacs='. The '=-n='
-option exists for compatibility with '=less=', but is ignored since
+'=-e=' option works like the '=--eval=' option to =emacs=. The '=-n='
+option exists for compatibility with =less=, but is ignored since
 it addresses a problem we don't have. Similarly, the '=-i=' and
-'=-I=' options also exist for compatibility with '=less=', but are
+'=-I=' options also exist for compatibility with =less=, but are
 ignored.
