@@ -1,0 +1,2661 @@
+#!/usr/bin/env bash
+## Runs Emacs in read-only-mode with view-mode enabled, with defaults and
+## keybindings that allow it to be used as a replacement for less, diff, man,
+## ls (?), etc.
+#
+# This script was directly inspired by and was initially based on the 'eless'
+# script by Kaushal Modi that can be found in the Git repository at
+# https://github.com/kaushalmodi/eless.git, but I've since made quite a few
+# changes to it.
+#
+# Also see https://crowding.github.io/blog/2014/08/16/replace-less-with-emacs/
+# which uses Emacs as a pager meant to be invoked from within (a shell
+# running under) Emacs: it opens the paged data in a new buffer of an/the
+# existing Emacs instance.
+#
+#  TODO:
+#  - keybindings
+#    - bind the remaining unbound plain letters/characters(?)
+#  - less options to (possibly, eventually) support:
+#    - -e/-E (?), -i/-I (?), -j (?), -K (?), -z (?)
+#    - we currently accept '-i' and '-I', but we just ignore them
+#
+# Copyright (C) 2017-2022 by James MacKay.
+#
+#-This program is free software: you can redistribute it and/or modify
+#-it under the terms of the GNU General Public License as published by
+#-the Free Software Foundation, either version 3 of the License, or
+#-(at your option) any later version.
+#
+#-This program is distributed in the hope that it will be useful,
+#-but WITHOUT ANY WARRANTY; without even the implied warranty of
+#-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#-GNU General Public License for more details.
+#
+#-You should have received a copy of the GNU General Public License
+#-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+#set -x
+
+# Redirect output to a log file: it will NOT go to stdout/stderr.
+#exec &> ~/log/$(basename "$0")-$(date -Ihours).log
+
+# Strict mode.
+STD_IFS="$IFS"  # = space, tab or newline
+#STRICT_IFS=$'\n\t'  # remove space from list if input field separators
+#STRICT_IFS="$(printf '\n\t')"
+#IFS="$STRICT_IFS"
+set -u  # don't allow use of unset variables
+#set -e  # exit this script if any command fails; use 'set +e' to disable
+set -o pipefail  # entire pipe fails if any part does; use 'set +o pipefail'
+                 # to disable
+
+# After setting IFS as above, we may need to use a tab in place of a space in
+# some places (e.g. when building up options in a variable).
+readonly TAB="$(printf '\t')"
+
+
+# Configuration.
+
+readonly PROG="$(basename "$0")"
+readonly PROG_DIR="$(dirname "$0")"  # the directory this script is in
+
+# We're debugging iff the basename we're run under starts with 'debug-' (so
+# we don't need to edit this script to switch between debugging and
+# production).
+#
+# Note: $PROG_BASE will be the same as $PROG except any 'debug-' prefix will
+# be removed from the start of it.
+readonly DEBUG_PREFIX="debug-"
+readonly PROG_BASE="${PROG##$DEBUG_PREFIX}"
+DO_DEBUG=0
+if [ "$PROG_BASE" != "$PROG" ]
+then
+    DO_DEBUG=1
+fi
+#echo "Value of DO_DEBUG is $DO_DEBUG"
+#exit 0
+
+
+# Verbosity levels.
+ERROR_VERBOSITY_LEVEL=0
+WARN_VERBOSITY_LEVEL=1
+INFORM_VERBOSITY_LEVEL=2
+
+# Current verbosity level.
+[ $DO_DEBUG -eq 0 ] && VERBOSITY=${WARN_VERBOSITY_LEVEL} || \
+                       VERBOSITY=${INFORM_VERBOSITY_LEVEL}
+
+
+ECHOER=echo
+ECHOER=
+
+# The pathname of our working directory, or an empty string if it hasn't been
+# set yet.
+#
+# See: createWorkingDirectory(), destructor().
+WORK_DIR=
+
+# The directory under which to create our working files, by default.
+readonly DEFAULT_TEMP_DIR="${TMPDIR:-/tmp}"
+
+# IFS=$'\n\t' # Separate fields in a sequence only on newlines and tabs
+IFS=$' ' # Separate fields in a sequence on space characters (only)
+
+# The directory we use to store temporary data.
+readonly TEMP_DIR="${TMPDIR:-/tmp}"
+
+# The pathname of the file that contains the data from our standard input,
+# or an empty string if we don't have any standard input.
+STDIN_FILE=""
+
+# The regular expression pattern to search for in each paged buffer when it's
+# initially opened, or an empty string if we're not searching for a pattern
+# then (i.e. if the "-p" option wasn't specified).
+INITIAL_SEARCH_REGEX=""
+
+# Iff this is set to 'y' then instead of passing our fairly massive amount of
+# configuration information on the command line we create temporary Emacs
+# Lisp source files and load those.
+#
+# Passing this information on the command line results in seriously unwieldy
+# entries for the Emacs processes that we start in the output of the 'ps'
+# command, often making searching through that command's output difficult if
+# not impossible.
+#USE_INIT_FILES=
+USE_INIT_FILES="y"
+
+
+readonly ELISP_PROLOGUE=$(cat <<'+++EOF+++'
+(progn
+    ;;(setq debug-on-error t)  ;; uncomment for debugging
+
+    ;; The canonical name of this Emacs variant.
+    ;;
+    ;; This is for use in pathnames, etc. used by us.
+    (defconst emp/canonical-name "empager")
+
+    ;; In terminal Emacs this will hopefully make the Backspace key generate
+    ;; DEL and the Delete key generate <deletechar>.
+    (setq normal-erase-is-backspace nil)
+
+    (defvar emp/initial-regexp nil
+        "The initial regular expression to move point to, if there is one.")
+
+    (defun emp/to-initial-regexp (regexp)
+        "Moves point to the first match of the regular expression REGEXP
+after point, and highlights all of the matches of REGEXP."
+        (search-forward-regexp regexp nil t)  ;; t => ignore errors/no match
+        (highlight-regexp regexp)  ;; use unhighlight-regexp to undo
+        (unless emp/initial-regexp
+            (setq emp/initial-regexp regexp)))
+
+    (defun emp/unhighlight-initial-regexp ()
+        "Unhighlights any and all matches of emp/initial-regexp that are
+highlighted."
+        (interactive)
+        (if emp/initial-regexp
+            (unhighlight-regexp emp/initial-regexp)))
+
+    (defun emp/reprepare-buffer ()
+        "Re-prepares the current buffer to contain regular paged input (as
+opposed to something we handle specially, like a man page).
+
+Note: this function differs from `emp/prepare-buffer' in that it can be
+called after the buffer has first been created, such as right after the
+buffer's contents have been reverted."
+        (setq view-read-only t)
+            ;; visiting files read-only does so in view-mode
+        (read-only-mode 1)
+        ;;(scroll-lock-mode 1)
+            ;; this is interesting, but ultimately a little annoying and not
+            ;; really an improvement
+        ;;(hl-line-mode 1)
+            ;; commented this out because the cursor already makes it pretty
+            ;; apparent which is the current line, and the face that we used
+            ;; to set for the highlighted line (see below) seems to end up
+            ;; being different on different machines that I use, in some
+            ;; cases even making the line almost unreadable
+
+        ;; Underline the current line, keeping the current line's foreground
+        ;; and background colours.
+        ;;
+        ;; Note: add ':bold t' to make the current line bold. It looks pretty
+        ;; good, but I think it's just a bit too much emphasis.
+        ;;
+        ;; Based on code found at:
+        ;; https://www.reddit.com/r/emacs/comments/dk9jdo/how_to_make_hlmode_underline_current_line/
+        ;;(set-face-attribute 'hl-line nil :background "black" :underline t)
+        ;;(set-face-attribute 'hl-line nil :underline t)
+        ;;(set-face-attribute 'hl-line nil :background "black" :foreground "green")
+    )
+
+    ;; From: https://emacs.stackexchange.com/questions/3925/hide-list-of-minor-modes-in-mode-line
+    (defun emp/modeline-set-lighter (minor-mode lighter)
+        "Sets LIGHTER to be the text that appears in the modeline when the
+minor mode represented by the symbol MINOR-MODE is enabled."
+        (when (assq minor-mode minor-mode-alist)
+            (setcar (cdr (assq minor-mode minor-mode-alist)) lighter)))
+
+    (defmacro emp/quietly (&rest body)
+        "Executes BODY except that all calls of `message' will output
+nothing."
+        `(cl-letf (((symbol-function 'message) #'ignore))
+            ,@body))
+
+    (defun emp/with-truncated-lines (orig-fun &rest args)
+        "Enables the truncating of lines - iff it isn't already - while
+(and only while) applying the function ORIG-FUN to ARGS."
+        (message "Lines originally truncated? %s" truncate-lines)
+        (if truncate-lines
+            (apply orig-fun args)  ;; else ...
+            (emp/quietly  ;; keep toggle-truncate-lines quiet
+                (toggle-truncate-lines)
+                (apply orig-fun args)
+                (toggle-truncate-lines))))
+
+    (defun emp/prepare-buffer ()
+        "Prepares the current buffer to contain regular paged input (as
+opposed to something we handle specially, like a man page).
+
+See also: `emp/reprepare-buffer'."
+        (delete-other-windows)
+            ;; causes our contents to be displayed in a full-frame window,
+            ;; even when more than one file is being paged
+        (emp/reprepare-buffer)
+
+        ;; Hide the lighter for view-mode since it's always enabled.
+        (emp/modeline-set-lighter 'view-mode "")
+
+        (add-hook 'after-revert-hook #'emp/reprepare-buffer))
+
+    ;; I don't care whether it's X or Emacs that occasionally screws with the
+    ;; backspace key so that it appears as C-h to Emacs, I don't use its
+    ;; help often enough to warrant it being mapped to C-h anyway. It'll be
+    ;; C-M-h (aka M-DEL) and the F1 function key (see below) from now on.
+    (global-set-key (kbd "C-h") #'delete-backward-char)
+    (global-set-key (kbd "M-DEL") #'help-command)
+
+
+    ;; Show everything in each org mode document, since if we specified
+    ;; the line number to start at it wouldn't actually start there if
+    ;; that line wasn't visible at startup.
+    (add-hook 'org-mode-hook #'show-all)
+
+    ;; Hitting RET on a link in an org mode document will visit the link.
+    (setq org-return-follows-link t)
+
+    ;; Allow visiting version-controlled files through a symlink: never ask.
+    (setq vc-follow-symlinks t)
+
+    ;; Control how the contents of dired buffers are generated by default.
+    ;;
+    ;; Note: not all switches may be supported on all platforms.
+    (setq dired-listing-switches "-lGaFvh1 --group-directories-first")
+
+    ;; Don't show a buffer menu window when more than two files are to be
+    ;; paged (which is the default).
+    (setq inhibit-startup-buffer-menu t)
+
+    ;; Automatically revert all buffers.
+    (global-auto-revert-mode 1)
+
+    ;; Avoid possible trojan horses: disable all local vars - don't even ask
+    (setq enable-local-variables nil)
+)
++++EOF+++
+)
+readonly ELISP_MIDDLE=$(cat <<'+++EOF+++'
+(progn
+    ;; Hide the lo-tech text menubar, as well as some other parts of the user
+    ;; interface.
+    (if (fboundp 'menu-bar-mode) (menu-bar-mode -1))
+    (when (functionp 'mouse-wheel-mode)
+        (mouse-wheel-mode -1))
+    (when (functionp 'tooltip-mode)
+        (tooltip-mode -1))
+    (when (functionp 'tool-bar-mode)
+        (tool-bar-mode -1))
+    (when (functionp 'blink-cursor-mode)  ; only on window systems
+        (blink-cursor-mode -1))
+
+
+    ;; Prefer UTF-8.
+    ;;
+    ;; From https://thraxys.wordpress.com/2016/01/13/utf-8-in-emacs-everywhere-forever/
+    (setq locale-coding-system 'utf-8)
+    (set-terminal-coding-system 'utf-8)
+    (set-keyboard-coding-system 'utf-8)
+    (set-selection-coding-system 'utf-8)
+    (prefer-coding-system 'utf-8)
+    ;;(when (display-graphic-p)
+        (setq x-select-request-type '(UTF8_STRING COMPOUND_TEXT STRING TEXT))
+    ;;)
+    ;;(set-default-coding-systems 'utf-8)
+    ;;(setq default-buffer-file-coding-system 'utf-8)
+    ;;;(setq buffer-file-coding-system 'utf-8)
+
+
+    ;; Try loading my custom theme, falling back to a pleasant built-in dark
+    ;; theme.
+    (setq custom-theme-directory
+        (concat user-emacs-directory "themes"))
+    (unless (ignore-errors (load-theme 'jgm-tty-1 :no-confirm))
+        (load-theme 'tango-dark :no-confirm))
+
+    ;; Change the colours used in the modeline so we can distinguish one of
+    ;; our instances from an 'empager' or "full" Emacs instance.
+    (set-face-attribute 'mode-line nil
+        :foreground "green" :background "black" :weight 'normal)
+    (set-face-attribute 'mode-line-buffer-id nil
+        :foreground "green" :background "black" :weight 'bold)
+    (set-face-attribute 'mode-line-inactive nil
+        :foreground "grey" :background "black" :weight 'normal)
+
+    ;; Smooth scrolling with no margins. (Only works properly with Emacs 26.1
+    ;; or later.)
+    (setq maximum-scroll-margin 0.5
+     scroll-margin 99999
+     scroll-preserve-screen-position t
+     scroll-conservatively 0)
+
+    ;; Show line and column numbers in the mode-line.
+    (line-number-mode 1)
+    (column-number-mode 1)
+
+    ;; A workaround for line-number-mode showing ?? instead of the line
+    ;; number in the mode line once it encounters an overly-long line.
+    (setq line-number-display-limit-width 10000)
+
+    ;; This built-in package will syntax-highlight miscellaneous types of
+    ;; files (e.g. /etc/fstab, /etc/hosts).
+    (require 'generic-x)
+
+    ;; Save regexp and non-regexp search strings: for some reason I've
+    ;; started feeling like I should be able to use search strings from the
+    ;; last pager use in the current one.
+    ;;
+    ;; We also save register contents, because why not? It could be handy.
+    (require 'savehist)  ;; a built-in package
+    (setq savehist-autosave-interval nil  ;; save on exit only
+        savehist-save-minibuffer-history nil  ;; don't save minibuffer hist.
+        savehist-additional-variables  ;; save searches and register contents
+            '(search-ring regexp-search-ring register-alist)
+        savehist-file-modes #o600)  ;; the default (currently)
+
+    ;; Save searches, etc. using my custom directory schema for saved data
+    ;; iff it appears to be present, and use a more standard location
+    ;; otherwise.
+    (let ((d (concat user-emacs-directory "saved/" emp/canonical-name "/")))
+        (setq savehist-file
+            (if (file-exists-p d)
+                (concat d "savehist")
+                (concat user-emacs-directory emp/canonical-name "-savehist"))))
+    (savehist-mode 1)  ;; enable saving searches, etc.
+
+    ;; Display the date/time (but not system load or mail info) on the
+    ;; modeline
+    (defun emp/always-nil (&rest _)
+        "Ignores its arguments - if any - and always evaluates to nil."
+        nil)
+    (setq display-time-mail-function #'emp/always-nil
+        display-time-default-load-average nil  ;; omit the load average
+        display-time-format "%a%d %-l:%M%#p"    ;; e.g. "Tue08 11:31pm"
+            ;; see the help for the format-time-string function for a summary
+            ;; of the '%' codes that can be used here; I intentionally didn't
+            ;; include the seconds part of the time because I thought the
+            ;; time updating that frequently might be too distracting
+        display-time-interval 15) ;; update time every 15 secs, not every 60
+    (display-time-mode 1)
+
+    ;; Sets what information appears in the mode line about where point is in
+    ;; the current buffer.
+    ;;
+    ;; From: http://www.holgerschurig.de/en/emacs-tayloring-the-built-in-mode-line/
+    (setq mode-line-position
+        ;;'((line-number-mode ("%l[%p]" (column-number-mode "%c")))))
+        '((line-number-mode ("%l" (column-number-mode ":%c")))
+             (-4 ":%p")))
+
+    ;; Default template for a buffer mode line.
+    ;;
+    ;; From: http://www.holgerschurig.de/en/emacs-tayloring-the-built-in-mode-line/
+    (defconst emp/emacs-pid (int-to-string (emacs-pid)))
+    (setq-default mode-line-format
+        '("%e"  ;; error message about full memory
+             ;;mode-line-front-space
+             ;;mode-line-mule-info  ;; always UTF8
+             ;;mode-line-client
+             ;;mode-line-remote
+             ;;mode-line-frame-identification
+             ;;" "
+             emp/emacs-pid
+                 ;; helpful when trying to stop/kill a specific emacs
+             mode-line-modified
+             " "
+             ;;mode-line-directory
+             mode-line-buffer-identification
+             " "
+             mode-line-position
+             ;;" "
+             mode-line-modes
+             mode-line-misc-info
+             " "
+             (vc-mode vc-mode)
+             ;;(flycheck-mode flycheck-mode-line)
+             ;;"  "
+             ;;mode-line-end-spaces
+    ))
+
+    ;; I currently don't understand 'ido' well enough for it not to annoy
+    ;; me on a very regular basis, and in some cases prevent me from doing
+    ;; something entirely.
+    ; (setq ido-enable-flex-matching t)  ;; enable fuzzy search
+    ; (setq ido-everywhere t)
+    ; (setq ido-create-new-buffer 'always)
+    ;     ;; create a new buffer if no buffer matches substringv
+    ; (setq ido-use-filename-at-point 'guess)
+    ;     ;; find file at point using ido
+    ; (ido-mode 1)
+    ; ;;(add-to-list 'ido-ignore-buffers "*Messages*")
+
+    (setq-default indent-tabs-mode nil)
+        ;; use spaces instead of tabs for indentation
+    (setq x-select-enable-clipboard t)
+    (setq x-select-enable-primary t)
+    (setq save-interprogram-paste-before-kill t)
+    (setq require-final-newline t)
+    (setq visible-bell nil)
+    (setq load-prefer-newer t)
+    (setq ediff-window-setup-function 'ediff-setup-windows-plain)
+
+    ;; During isearch have the backspace key delete all of the characters
+    ;; that don't match, or just the last character if they all match.
+    ;;
+    ;; From: https://gist.github.com/johnmastro/508fb22a2b4e1ce754e0 via
+    ;; http://endlessparentheses.com/better-backspace-during-isearch.html
+    (defun emp/isearch-delete-something ()
+        "Delete non-matching text or the last character."
+        (interactive)
+        (if (= 0 (length isearch-string))
+            (ding)
+            (setq isearch-string (substring isearch-string 0
+                                     (or (isearch-fail-pos)
+                                         (1- (length isearch-string)))))
+            (setq isearch-message
+                (mapconcat #'isearch-text-char-description isearch-string "")))
+        (if isearch-other-end (goto-char isearch-other-end))
+        (isearch-search)
+        (isearch-push-state)
+        (isearch-update))
+
+    (setq isearch-allow-scroll t)  ;; allow scrolling using isearch
+    ;; DEL during isearch should edit the search string (deleting ALL
+    ;; unmatched chars, not just the last one), not jump back to the previous
+    ;; result.
+    (define-key isearch-mode-map [remap isearch-delete-char]
+        #'emp/isearch-delete-something)
+        ;;#'isearch-del-char)
+    (add-hook 'isearch-update-post-hook #'recenter)
+        ;; put search matches in the middle of the screen
+
+    ;; Have isearch work a little like ivy/swiper by default, such that a
+    ;; space in a non-regexp isearch will match any sequence of characters.
+    ;;
+    ;; You can toggle this behaviour off and on interactively while an
+    ;; isearch is in progress using the 'M-s SPC' keybinding.
+    ;;
+    ;; Note: this is commented out since it turns out it rarely does what I
+    ;; want while making it harder to match strings containing specific
+    ;; whitespace substrings (e.g. 'class Foo').
+    ;;(setq isearch-lax-whitespace t)
+    ;;(setq isearch-regexp-lax-whitespace nil)  ;; not for regexp searches
+    ;;(setq search-whitespace-regexp ".*")
+
+    ;; Don't truncate long lines by default: use 't' to toggle this.
+    ;;
+    ;; Note: 'inhibit-message' will prevent the 'Truncate long lines
+    ;; disabled' message in Emacs 25+.
+    (setq truncate-partial-width-windows nil)
+        ;; respect the value of truncate-lines
+    (let ((inhibit-message t))
+        (toggle-truncate-lines -1))  ;; don't truncate
+        ;;(toggle-truncate-lines t))   ;; truncate
+
+    ;; Switch the focus to the help window whenever one's opened. (Then it
+    ;; can be closed using 'q', plus it can be navigated somewhat more
+    ;; easily.)
+    ;;
+    ;; From a comment on:
+    ;; https://www.reddit.com/r/emacs/comments/6i7odu/killing_the_help_window_quickly/
+    (setq help-window-select t)
+
+    ;; When opening a man page make it the current buffer in the current
+    ;; window. (See the documentation for Man-notify-method for all available
+    ;; values.)
+    (setq Man-notify-method 'pushy)
+)
++++EOF+++
+)
+readonly ELISP_EPILOGUE=$(cat <<'+++EOF+++'
+(progn
+    ;;; Custom functions.
+
+    ;; From: https://github.com/howardabrams/dot-files/blob/master/emacs-eshell.org
+    (defun emp/new-eshell-here ()
+        "Opens a new eshell in a new window in the directory associated with
+    the current buffer's file. The eshell is renamed to match that directory
+    in order to make managing/distinguishing multiple eshell windows easier."
+        (interactive)
+        (let* ((parent (if (buffer-file-name)
+                           (file-name-directory (buffer-file-name))
+                           default-directory))
+               (height (/ (window-total-height) 3))
+               (name (car (last (split-string parent "/" t)))))
+            (split-window-vertically (- height))
+            (other-window 1)
+            (eshell "new")
+            (rename-buffer (concat "*eshell: " name "*"))
+
+            ;; Run commands when the shell first opens.
+            (insert (concat "ls; pwd"))
+            (eshell-send-input)))
+
+    ;; Note: the functions with the 'eshell/' prefix define eshell commands
+    ;; (and the prefix is required for them to be recognized as such).
+
+    ;; From a comment on:
+    ;; https://www.reddit.com/r/emacs/comments/772b3h/what_are_you_using_eshell_for/
+    (defun eshell/clear ()
+        "Clears/erases the eshell buffer."
+        (let ((inhibit-read-only t))
+            (erase-buffer)
+            (eshell-send-input)))
+
+    ;; Note: this is especially useful when the eshell buffer is short/small,
+    ;; as when it's been created by the emp/new-eshell-here function.
+    (defun eshell/dl ()
+        "Opens a dired buffer on this shell's current working directory, but
+    in another window."
+        (dired-other-window "."))
+
+    ;; From: https://github.com/howardabrams/dot-files/blob/master/emacs-eshell.org
+    (defun eshell/f (filename &optional dir)
+        "Searches for files (or symlinks to files) in and under the current
+    directory that match the given glob-like pattern.
+
+    This is a simple wrapper around the standard `find' function."
+        (let ((cmd (concat
+                       "find -L " (or dir ".")
+                       "      -not -path '*.git*'"
+                       " -and -not -path '*node_modules*'"
+                       " -and -not -path '*classes*'"
+                       " -and -type f -and "
+                       " -iname '" filename "'")))
+            ;;(message cmd)
+            (shell-command-to-string cmd)))
+
+    ;; Typing 'find' in Eshell runs the find function (as opposed to running
+    ;; the external executable), and creating an alias for it doesn't work.
+    ;; So we define this Eshell "shell function" instead.
+    ;;
+    ;; From: https://github.com/howardabrams/dot-files/blob/master/emacs-eshell.org
+    (defun eshell/find (&rest args)
+        "Wrapper around the `find' executable."
+        (let ((cmd (concat "find " (eshell-flatten-and-stringify args))))
+            (shell-command-to-string cmd)))
+
+    (defun eshell/h (&rest args)
+        "Lists the eshell buffer's history in a help buffer."
+    ;; FUTURE: iff an argument is specified then list (maybe not in a help
+    ;; buffer?) only those history items that match the pattern
+    ;; - error if more than one arg
+        (eshell-list-history))
+
+    ;; From: https://github.com/howardabrams/dot-files/blob/master/emacs-eshell.org
+    (defun eshell/p (filename &optional dir)
+        "Searches (using `eshell/f') for the first matching filename and
+    loads it into a pager buffer."
+        (let* ((files (eshell/f filename dir))
+               (file (car (save-match-data (split-string files "\n")))))
+            (find-file file)
+            (emp/prepare-buffer)))
+
+    ;; From: http://fasciism.com/2017/01/27/eshell-kill-previous-output/
+    ;;(require 'em-prompt)  ;; for eshell-prompt-regexp
+    (defun eshell/sv (&optional nth)
+        "Copies the output of the previous command to the kill ring. When NTH
+    is set it will copy the output of the n'th previous command instead."
+        (save-excursion
+            (goto-char (point-max))
+               ;; move to the end of the eshell buffer
+            (search-backward-regexp eshell-prompt-regexp nil nil nth)
+                ;; move to the start of the last prompt
+            (beginning-of-line)
+                ;; move to the start of the line, before the prompt
+            (let ((end (point)))  ;; remember this point as end of the region
+                (search-backward-regexp eshell-prompt-regexp)
+                    ;; move to the start of the last prompt
+                (forward-line)
+                    ;; move one line below the prompt, where output begins
+
+                ;; Find the first line that's not blank.
+                (while (looking-at "^[[:space:]]*$")
+                    (beginning-of-line)
+                    (forward-line))
+
+                (copy-region-as-kill (point) end)
+                    ;; copy the region we just defined to the kill ring
+                (format "Copied %s words to kill ring."
+                    (count-words-region (point) end))
+                    ;; output stats about what was copied, as a sanity check
+    )))
+
+    ;; Note: this closes the window the eshell is running in too. It's mainly
+    ;; intended to be used to exit from the eshell started by the function
+    ;; emp/new-eshell-here.
+    ;;
+    ;; From: https://www.reddit.com/r/emacs/comments/6otyj8/eschewing_zshell_inside_eshell/
+    (defun eshell/x (&rest args)
+        "Closes the current eshell window."
+        (delete-window)
+        (eshell/exit))
+
+
+    (defun emp/normalize-buffer-name (&optional buffer-or-name)
+        "Returns the name of the buffer specified by `buffer-or-name', or of
+    the current buffer if `buffer-or-name' is nil."
+        (interactive)
+        (if buffer-or-name
+            (if (bufferp buffer-or-name)
+                (buffer-name buffer-or-name)
+                buffer-or-name)
+            (buffer-name (current-buffer))))
+
+    ;; Note: this code is taken pretty much verbatim from the definition of
+    ;; the `ibuffer-mark-special-buffers' function in ibuf-ext.el.
+    (defun emp/is-special-buffer (&optional buffer-or-name)
+        "Returns non-nil if the buffer specified by `buffer-or-name' - or the
+    current buffer if `buffer-or-name' is nil - is a special buffer, and nil
+    if it isn't."
+        (string-match "^\\*.+\\*$"
+                     (emp/normalize-buffer-name buffer-or-name)))
+
+    (defun emp/is-paged-buffer (&optional buffer-or-name)
+        "Returns t if the buffer indicated by BUFFER-OR-NAME (or the
+    current buffer if BUFFER-OR-NAME is not specified) is considered to be
+    one that we are to be used as a pager for, and nil if it is not.
+
+    Note: the following are NOT considered to be paged buffers: man page
+    buffers, dired buffers, hidden/internal buffers and special buffers
+    (like the scratch and message buffers)."
+        (interactive)
+        (let ((bname (emp/normalize-buffer-name buffer-or-name)))
+            (if (string-prefix-p "*Stdin*" bname)
+                t
+                (if (or (emp/is-special-buffer bname)
+                        (string-prefix-p " " bname))
+                    nil
+                    (if (string-equal major-mode "dired-mode")
+                        nil
+                        t)))))
+
+    ;; From: http://ergoemacs.org/emacs/elisp_next_prev_user_buffer.html
+    (defun emp/next-paged-buffer ()
+        "Switch to the next paged buffer, where which buffers are paged
+    buffers is determined by the function emp/is-paged-buffer."
+        (interactive)
+        (next-buffer)
+        (let ((i 0))
+            (while (< i 20)
+                (if (not (emp/is-paged-buffer))
+                    (progn
+                        (next-buffer)
+                        (setq i (1+ i)))
+                    (setq i 100)))))
+
+    ;; From: http://ergoemacs.org/emacs/elisp_next_prev_user_buffer.html
+    (defun emp/previous-paged-buffer ()
+        "Switch to the previous paged buffer, where which buffers are
+    paged buffers is determined by the function emp/is-paged-buffer."
+        (interactive)
+        (previous-buffer)
+        (let ((i 0))
+            (while (< i 20)
+                (if (not (emp/is-paged-buffer))
+                    (progn
+                        (previous-buffer)
+                        (setq i (1+ i)))
+                    (setq i 100)))))
+
+
+    (defun emp/end-or-beginning-of-buffer ()
+        "Moves point to the end of the buffer unless it is already there,
+    in which case moves point to the beginning of the buffer."
+        (interactive)
+        (if (eobp)
+            (beginning-of-buffer)
+            (end-of-buffer)))
+
+    (defun emp/switch-windows-or-buffers ()
+        "Switches to the other window unless there is currently only one
+    window, in which case switch to the next-most-recent buffer."
+        (interactive)
+        (if (one-window-p)
+            (switch-to-buffer (other-buffer (current-buffer) t))
+            (other-window 1)))
+
+    (defun emp/delete-other-windows-or-end-of-buffer ()
+        "If there is more than one window then deletes all of the other
+    windows; otherwise move point to the end of the buffer."
+        (interactive)
+        (if (one-window-p)
+            (end-of-buffer)
+            (delete-other-windows)))
+
+
+    ;; From: http://whattheemacsd.com/key-bindings.el-01.html
+    (defun emp/goto-line-with-feedback ()
+        "Show line numbers, but only while waiting for the line number to
+    go to."
+        (interactive)
+        (unwind-protect
+            (progn
+                (linum-mode 1)
+                (forward-line (- (read-number "Goto line: ")
+                                               (line-number-at-pos))))
+            (linum-mode -1)))
+
+
+    (defvar emp/cycle-through-buffers-keymap
+        (let ((m (make-sparse-keymap)))
+            (fset 'dk (lambda (k f) (define-key m (kbd k) f)))
+            (dk "C-<left>"    #'emp/previous-buffer-repeatable)
+            (dk "C-<right>"   #'emp/next-buffer-repeatable)
+            (dk "<left>"  #'emp/previous-paged-buffer-repeatable)
+            (dk "<right>" #'emp/next-paged-buffer-repeatable)
+            (dk "s" #'switch-to-buffer)  ;; like C-x b
+            (dk "l" #'list-buffers)      ;; like C-x C-b
+            m))
+
+    (defun emp/set--cycle-through-buffers-transient-map ()
+        "Sets the transient keymap to emp/cycle-through-buffers-keymap,
+    and also outputs to the minibuffer a single line summarizing the
+    actions available in that keymap."
+        (message "(C-)left/right:previous/next paged (any) buffer; (l)ist; (s)elect")
+        (set-transient-map emp/cycle-through-buffers-keymap))
+
+    (defun emp/previous-buffer-repeatable ()
+        "Switches to the previous buffer in the selected window."
+        (interactive)
+        (previous-buffer)
+        (emp/set--cycle-through-buffers-transient-map))
+
+    (defun emp/next-buffer-repeatable ()
+        "Switches to the next buffer in the selected window."
+        (interactive)
+        (next-buffer)
+        (emp/set--cycle-through-buffers-transient-map))
+
+    (defun emp/previous-paged-buffer-repeatable ()
+        "Switches to the previous paged buffer in the selected window."
+        (interactive)
+        (emp/previous-paged-buffer)
+        (emp/set--cycle-through-buffers-transient-map))
+
+    (defun emp/next-paged-buffer-repeatable ()
+        "Switches to the next paged buffer in the selected window."
+        (interactive)
+        (emp/next-paged-buffer)
+        (emp/set--cycle-through-buffers-transient-map))
+
+
+    (defvar emp/move-in-other-window-keymap
+        (let ((m (make-sparse-keymap)))
+            (fset 'dk (lambda (k f) (define-key m (kbd k) f)))
+            (dk "<up>"    #'emp/move-up-line-in-other-window-repeatable)
+            (dk "<down>"  #'emp/move-down-line-in-other-window-repeatable)
+            (dk "<prior>" #'emp/move-up-page-in-other-window-repeatable)
+            (dk "<next>"  #'emp/move-down-page-in-other-window-repeatable)
+            m))
+
+    (defun emp/set--move-in-other-window-transient-map ()
+        "Sets the transient keymap to emp/move-in-other-window-keymap,
+    and also outputs to the minibuffer a single line summarizing the
+    actions available in that keymap."
+        (message "up/down: line; PgUp/PgDown: page")
+        (set-transient-map emp/move-in-other-window-keymap))
+
+    (defun emp/move-up-line-in-other-window-repeatable ()
+        "Moves point up one line in the other buffer."
+        (interactive)
+        (scroll-other-window -1)
+        (emp/set--move-in-other-window-transient-map))
+
+    (defun emp/move-down-line-in-other-window-repeatable ()
+        "Moves point down one line in the other buffer."
+        (interactive)
+        (scroll-other-window 1)
+        (emp/set--move-in-other-window-transient-map))
+
+    (defun emp/move-up-page-in-other-window-repeatable ()
+        "Moves point up one line in the other buffer."
+        (interactive)
+        (scroll-other-window '-)
+        (emp/set--move-in-other-window-transient-map))
+
+    (defun emp/move-down-page-in-other-window-repeatable ()
+        "Moves point up one line in the other buffer."
+        (interactive)
+        (scroll-other-window nil)
+        (emp/set--move-in-other-window-transient-map))
+
+
+    (defun emp/keep-lines ()
+        (interactive)
+        (let ((inhibit-read-only t))  ;; ignore read-only status of buffer
+            (save-excursion
+                (goto-char (point-min))
+                (call-interactively 'keep-lines))))
+
+    (defun emp/delete-matching-lines ()
+        (interactive)
+        (let ((inhibit-read-only t))  ;; ignore read-only status of buffer
+            (save-excursion
+                (goto-char (point-min))
+                (call-interactively 'delete-matching-lines))))
+
+
+    (defun emp/edit-and-wait-in-main-emacs ()
+        "Open the current file (at the line containing point) for editing in
+my main Emacs instance and wait until the buffer is exited."
+        (interactive)
+        (emp/edit--in-main-emacs nil))
+
+    (defun emp/no-wait-edit-in-main-emacs ()
+        "Open the current file (at the line containing point) for editing in
+my main Emacs instance and return immediately."
+        (interactive)
+        (emp/edit--in-main-emacs t))
+
+    (defun emp/edit--in-main-emacs (&optional dontWait)
+        "Open the current file (at the line containing point) for editing in
+my main Emacs instance, and wait until the buffer is exited iff 'dontWait'
+is non-nil."
+        (interactive)
+        (let ((f (buffer-file-name)))
+            (if (null f)
+                (error "No file in this buffer to edit.")
+                (unless dontWait (message "Waiting for editor ..."))
+                (shell-command (format "emacsclient %s +%i \"%s\""
+                    (if dontWait "-n" "")
+                    (save-restriction
+                        (widen)
+                        (line-number-at-pos))
+                    f))
+                (message (if dontWait
+                             "File successfully opened in editor."
+                             "Editing complete.")))))
+
+
+    (defun emp/frame-width-half (double)
+        (interactive "P")
+        ;; Do not round frame sizes to character height/width.
+        (let ((frame-resize-pixelwise t)
+              (factor (if double 2 0.5)))
+            (set-frame-size nil (round (* factor (frame-text-width)))
+                (frame-text-height) :pixelwise)))
+
+    (defun emp/frame-width-double ()
+        (interactive)
+        (emp/frame-width-half :double))
+
+    (defun emp/frame-height-half (double)
+        (interactive "P")
+        ;; Do not round frame sizes to character height/width.
+        (let ((frame-resize-pixelwise t)
+              (factor (if double 2 0.5)))
+            (set-frame-size nil (frame-text-width)
+                (round (* factor (frame-text-height))) :pixelwise)))
+
+    (defun emp/frame-height-double ()
+        (interactive)
+        (emp/frame-height-half :double))
+
+    (defun emp/enable-diff-mode-maybe ()
+        (interactive)
+        (save-excursion
+            (goto-char (point-min))
+            (when (re-search-forward
+               "^\\(?:[0-9]+,\\)?[0-9]+\\(?1:[adc]\\)\\(?:[0-9]+,\\)?[0-9]+$"
+               nil :noerror)
+                (forward-line 1)
+                (let ((diff-type (match-string-no-properties 1))
+                      (diff-mode-enable nil))
+                    (cond
+                        ;; Line(s) added
+                        ((string= diff-type "a")
+                             (when (re-search-forward "^> " nil :noerror)
+                                 (setq diff-mode-enable t)))
+                        ;; Line(s) deleted or changed
+                        (t
+                            (when (re-search-forward "^< " nil :noerror)
+                                 (setq diff-mode-enable t))))
+                    (when diff-mode-enable
+                        (diff-mode)
+                        (rename-buffer "*Diff*" :unique)
+                        (read-only-mode 1))))))  ;; re-enable read-only-mode
+
+    (defun emp/try-to-kill-buffer (name)
+        (message "Trying to kill buffer named %s" name)
+        (if (bufferp name)
+            (kill-buffer name)))
+
+    (defun emp/try-to-bury-buffer (name)
+        ;;(message "Trying to bury buffer named %s" name)
+        (if (bufferp name)
+            (bury-buffer name)))
+
+    (defun emp/point-to-register (register-name)
+        "Saves point in the register named REGISTER-NAME.
+
+    Note: register names are always single characters."
+        (interactive)
+        (point-to-register register-name)
+
+        ;; We output a message so that we have some sort of feedback that
+        ;; this command worked.
+        (message "Point saved in register '%c'." register-name))
+
+    (defun emp/kill-emacs-or-buffer ()
+        "Kill this Emacs instance if at most one paged buffer is open.
+    Otherwise just kill the current buffer and make the new current buffer
+    the next paged buffer."
+        (interactive)
+        (let ((num-paged 0))
+            (dolist (buf (buffer-list))
+                (with-current-buffer buf
+                    (if (emp/is-paged-buffer)
+                        (progn
+                            ;;(message "Is paged buffer: %s" buf)
+                            (setq num-paged (+ 1 num-paged))))))
+            ;;(message "num. paged = %s" num-paged)
+            (if (<= num-paged 1)
+                ;; Since this is a pager and not an editor we should ideally
+                ;; never have any modified buffers that need saving; but they
+                ;; seem to occur anyway (even when I haven't edited them).
+                ;; I never want to save them, though, so we use 'kill-emacs'
+                ;; rather than 'save-buffers-kill-emacs' here so we don't get
+                ;; asked to. (If a user does manage to intentionally edit one
+                ;; of our buffers then they're responsible for saving it
+                ;; before they exit).
+                (kill-emacs)  ;; kill Emacs instance
+                (kill-buffer (current-buffer))
+                ;; Make the current buffer the next paged one (which must
+                ;; exist, or we would have killed Emacs instead).
+                (unless (emp/is-paged-buffer)
+                    (emp/next-paged-buffer)))))
+
+    (defun emp/revert-buffer-retain-view-mode ()
+        (interactive)
+        (let ((view-mode-state view-mode))
+            (revert-buffer)
+            (when view-mode-state
+                (view-mode 1))))
+
+    ;; Auto-enable diff-mode; diff foo bar | eless
+    (emp/enable-diff-mode-maybe)
+
+    ;; Key mappings.
+    (fset 'dm (lambda (k v) (define-key input-decode-map k v)))
+
+    (dm "\e[ d" [left])    ; left arrow
+    (dm "\e[ c" [right])   ; right arrow
+    (dm "\e[ a" [up])      ; up arrow
+    (dm "\e[ b" [down])    ; down arrow
+    (dm (kbd "\e[ H") [home])    ; Home
+    (dm (kbd "\e[ F") [end])     ; End
+
+    (dm "\e[1;5A" [C-up])    ; up arrow
+    (dm "\e[1;5B" [C-down])  ; down arrow
+    (dm "\e[1;5D" [C-left])  ; left arrow
+    (dm "\e[1;5C" [C-right]) ; right arrow
+
+    (dm "\e[5A" [C-up])      ; up arrow
+    (dm "\e[5B" [C-down])    ; down arrow
+    (dm "\e[5D" [C-left])    ; left arrow
+    (dm "\e[5C" [C-right])   ; right arrow
+
+    (dm "\e[5;5~" [C-prior])   ; PageUp
+    (dm "\e[6;5~" [C-next])    ; PageDown
+    (dm "\e[2;5~" [C-insert])
+    (dm "\e[1;5H" [C-home])    ; home
+    (dm "\e[1;5F" [C-end])     ; end
+    (dm "\e[3;5~" [C-delete])  ; delete
+
+    (dm "\e[1;7D" [C-M-left])    ; left arrow
+    (dm "\e[1;7C" [C-M-right])   ; right arrow
+    (dm "\e[1;7A" [C-M-up])      ; up arrow
+    (dm "\e[1;7B" [C-M-down])    ; down arrow
+
+    ;; Configure dired-mode.
+    (defun emp/dired-mode-customization ()
+        ;; Prevent view-mode bindings from shadowing dired-mode bindings.
+        (view-mode -1)
+        (fset 'ddk (lambda (k f) (define-key dired-mode-map (kbd k) f)))
+        ;;(ddk "RET" #'emp/dired-view-file-read-only)
+        ;;(ddk "f" #'emp/dired-view-file-read-only)
+        (ddk "RET" #'dired-view-file)
+        (ddk "E" #'wdired-change-to-wdired-mode)
+        (ddk "Q" #'quit-window)
+        (ddk "q" #'emp/kill-emacs-or-buffer))
+    (add-hook 'dired-mode-hook
+        #'emp/dired-mode-customization)
+    (when (derived-mode-p 'dired-mode)
+        (emp/dired-mode-customization))
+
+    ;; Configure archive-mode (for zip files and the like).
+    (defun emp/archive-mode-customization ()
+        (fset 'ddk (lambda (k f) (define-key archive-mode-map (kbd k) f)))
+        (ddk "RET" #'archive-view)
+        (ddk "Q" #'quit-window)
+        (ddk "q" #'emp/kill-emacs-or-buffer))
+    (add-hook 'archive-mode-hook
+        #'emp/archive-mode-customization)
+    (when (derived-mode-p 'archive-mode)
+        (emp/archive-mode-customization))
+
+    ;; Configure tar-mode.
+    (defun emp/tar-mode-customization ()
+        (fset 'ddk (lambda (k f) (define-key tar-mode-map (kbd k) f)))
+        (ddk "RET" #'tar-view)
+        (ddk "Q" #'quit-window)
+        (ddk "q" #'emp/kill-emacs-or-buffer))
+    (add-hook 'tar-mode-hook
+        #'emp/tar-mode-customization)
+    (when (derived-mode-p 'tar-mode)
+        (emp/tar-mode-customization))
+
+    ;; Change questions that usually have to be answered "yes" or "no" to
+    ;; allow "y" or "n".
+    (defalias 'yes-or-no-p 'y-or-n-p)
+
+    ;; Don't warn about large files unless they're *really* large.
+    (setq large-file-warning-threshold (* 150 1024 1024))  ;; 150MB
+
+    ;; The keymap that C-v will be a prefix key for in the global keymap.
+    (defvar emp/view-mode-submap nil)
+
+    ;; Recenter after jumping to a point stored in a register.
+    ;;
+    ;; Note: this is commented out because it doesn't allow one to enter the
+    ;; name of the register to jump to. Clearly I'm missing something. In any
+    ;; case
+    ;;(advice-add 'jump-to-register :after #'recenter)
+
+
+    (defun emp/add--custom-view-mode-bindings (m)
+        "Adds the custom view-mode keybindings to the keymap m."
+        (fset 'dk (lambda (k f) (define-key m (kbd k) f)))
+
+        (when (display-graphic-p)
+            (dk "+" #'text-scale-adjust)
+            (dk "-" #'text-scale-adjust)
+            (dk "=" #'text-scale-adjust))
+
+        ;; Each shifted digit saves point in a register named for the digit
+        ;; and the corresponding digit jumps to the point saved in the
+        ;; register named for the digit.
+        (dk "!" (lambda () (interactive) (emp/point-to-register ?1)))
+        (dk "1" (lambda () (interactive) (jump-to-register ?1)))
+        (dk "@" (lambda () (interactive) (emp/point-to-register ?2)))
+        (dk "2" (lambda () (interactive) (jump-to-register ?2)))
+        (dk "#" (lambda () (interactive) (emp/point-to-register ?3)))
+        (dk "3" (lambda () (interactive) (jump-to-register ?3)))
+        (dk "$" (lambda () (interactive) (emp/point-to-register ?4)))
+        (dk "4" (lambda () (interactive) (jump-to-register ?4)))
+        (dk "%" (lambda () (interactive) (emp/point-to-register ?5)))
+        (dk "5" (lambda () (interactive) (jump-to-register ?5)))
+        (dk "^" (lambda () (interactive) (emp/point-to-register ?6)))
+        (dk "6" (lambda () (interactive) (jump-to-register ?6)))
+        (dk "&" (lambda () (interactive) (emp/point-to-register ?7)))
+        (dk "7" (lambda () (interactive) (jump-to-register ?7)))
+        (dk "*" (lambda () (interactive) (emp/point-to-register ?8)))
+        (dk "8" (lambda () (interactive) (jump-to-register ?8)))
+        (dk "(" (lambda () (interactive) (emp/point-to-register ?9)))
+        (dk "9" (lambda () (interactive) (jump-to-register ?9)))
+
+        ;;(dk "!" #'emp/delete-matching-lines)  ;; also bound to 'K'
+        ;;(dk "&" #'emp/keep-lines)             ;; also bound to 'k'
+        (dk "0" #'delete-window)
+        ;;(dk "1" #'delete-other-windows)  ;; also bound to '<end>'
+        ;;(dk "2" #'split-window-below)    ;; also bound to 'C-x 2' (default)
+
+        (dk "/" #'isearch-forward)  ;; DWIM when I hit the 'less' search key
+        (dk "C-a" #'beginning-of-line)
+        ;;(dk "A" (lambda () (interactive) (message "Is paged? %s" (emp/is-paged-buffer))))
+        (dk "b" #'ibuffer) ;; show buffer list
+        (dk "c" #'other-window)
+        (dk "d" #'kill-ring-save)
+        (dk "C-d" #'kill-ring-save)  ;; same as "w"
+        (dk "e" #'emp/no-wait-edit-in-main-emacs)
+        (dk "E" #'emp/edit-and-wait-in-main-emacs)
+        (dk "C-e" #'end-of-line)
+        (dk "f" #'auto-revert-tail-mode)
+        (dk "g" #'emp/revert-buffer-retain-view-mode)
+            ;; revert the buffer, then put us back in view mode iff we were
+            ;; in it to begin with (since reverting it seems to disable that)
+        (dk "H" #'emp/unhighlight-initial-regexp) ;; undo highlights from '-p'
+        (dk "j" #'jump-to-register)
+        (dk "J" #'emp/end-or-beginning-of-buffer)
+        (dk "k" #'emp/keep-lines)
+        (dk "K" #'emp/delete-matching-lines)
+        (dk "l" #'recenter-top-bottom)
+        (dk "n" #'emp/next-paged-buffer)
+        (dk "N" #'next-error)      ;; or next line in *occur*
+        (dk "C-n" #'next-buffer)
+        (dk "o" #'occur)
+        (dk "p" #'emp/previous-paged-buffer)
+        (dk "P" #'previous-error)  ;; or previous line in *occur*
+        (dk "C-p" #'previous-buffer)
+        (dk "q" #'emp/kill-emacs-or-buffer)
+        (dk "Q" #'kill-emacs)
+        ;;(dk "Q" #'save-buffers-kill-emacs)
+        (dk "S" #'flyspell-mode)
+            ;; toggle spellchecking the buffer: when enabled misspelled
+            ;; words are underlined
+        (dk "t" #'toggle-truncate-lines)
+        (dk "u" #'universal-argument)
+        (dk "w" #'kill-ring-save)
+            ;; C-w is kill-region, but since the buffer is read-only it
+            ;; does the same thing as this: also see C-d
+
+        (dk "C-v" #'view-mode)
+             ;; restores the current buffer to view-mode
+
+        ;; Replace view mode's binding for RET with one that will open links,
+        ;; even external links and org-formatted links outside of org mode
+        ;; buffers. (I don't think I've ever used the default binding.)
+        (dk "RET" #'org-open-at-point-global)
+
+        ;; This seems to get bound to 'C-c &' here, but it's 'C-c j' globally
+        ;; in my main Emacs, so bind it to that here too.
+        (dk "C-c j" #'org-mark-ring-goto)
+
+        ;;(dk "<home>" #'beginning-of-buffer)
+        (dk "<end>" #'delete-other-windows)
+        (dk "C-M-<end>" #'emp/delete-other-windows-or-end-of-buffer)
+
+        ;; Have my Backspace key (which seems to be C-h) and my Delete key
+        ;; (which seems to be <deletechar>) do the opposite of what SPC does
+        ;; in this mode.
+        (dk "C-h" #'View-scroll-page-backward)
+        (dk "<deletechar>" #'View-scroll-page-backward)
+
+        ;; Replace default bindings - which scroll left/right - with ones
+        ;; that scroll up/down a half page at a time.
+        ;;
+        ;; From: https://writequit.org/articles/working-with-logs-in-emacs.html
+        (dk "C-<prior>" #'View-scroll-half-page-backward)
+        (dk "C-<next>"  #'View-scroll-half-page-forward)
+
+        (dk "C-M-<left>"  #'emp/previous-paged-buffer)
+        (dk "C-M-<right>" #'emp/next-paged-buffer)
+    )
+
+    (defun emp/get--view-mode-submap ()
+        "Returns the submap of the global keymap that contains the custom
+    view-mode keybindings, creating and setting it first iff it has not
+    been already."
+        (unless emp/view-mode-submap
+            (define-prefix-command 'emp/view-mode-submap)
+            (emp/add--custom-view-mode-bindings 'emp/view-mode-submap))
+        'emp/view-mode-submap)
+
+    ;; Add custom bindings to the view-mode keymap iff we are using that
+    ;; mode.
+    (when (boundp 'view-mode-map)
+        ;;(message "Adding bindings to view-mode-map too!!!")
+        (emp/add--custom-view-mode-bindings view-mode-map))
+
+    ;; Global custom keybindings.
+    (fset 'gk (lambda (k f) (global-set-key (kbd k) f)))
+    (gk "M-/" #'hippie-expand)
+    (gk "C-x k" #'kill-this-buffer)
+    (gk "C-x K" #'kill-buffer)
+    (gk "C-x C-b" #'ibuffer)
+    (gk "C-x C-f" #'view-file)
+    (gk "C-x C-m" #'execute-extended-command)
+        ;; I find this easier than M-x, and I don't use the default binding
+    (gk "C-c q" #'query-replace-regexp)
+    (gk "C-o" #'occur)  ;; closest default thing to counsel-grep-or-swiper
+    (gk "C-v" (emp/get--view-mode-submap))
+        ;; now a prefix key to access custom view-mode keybindings: use
+        ;; PgDown to scroll down, which is what C-v does by default
+        ;; - use C-v C-v to restore view mode
+    (gk "C-z" #'zap-to-char)  ;; also prevents this from suspending us
+        ;; note that this usually just goes to the next instance of the
+        ;; character since almost all of our buffers are read-only
+
+    (gk "<insertchar>" #'emp/switch-windows-or-buffers)
+    (gk "C-<home>" #'beginning-of-buffer)
+    (gk "C-<end>"  #'end-of-buffer)
+    (gk "C-<left>"  #'left-word)
+    (gk "C-<right>" #'right-word)
+    (gk "C-<up>"   #'backward-paragraph)
+    (gk "C-<down>" #'forward-paragraph)
+
+    (gk "<f7>" #'toggle-truncate-lines)
+    (gk "<f8>" #'emp/goto-line-with-feedback)
+    (gk "<f9>" #'emp/new-eshell-here)
+
+    (gk "C-x <left>"    #'emp/previous-paged-buffer-repeatable)
+    (gk "C-x <right>"   #'emp/next-paged-buffer-repeatable)
+    (gk "C-x C-<left>"  #'emp/previous-buffer-repeatable)
+    (gk "C-x C-<right>" #'emp/next-buffer-repeatable)
+
+    (gk "C-x <up>"    #'emp/move-up-line-in-other-window-repeatable)
+    (gk "C-x <down>"  #'emp/move-down-line-in-other-window-repeatable)
+    (gk "C-x <prior>" #'emp/move-up-page-in-other-window-repeatable)
+    (gk "C-x <next>"  #'emp/move-down-page-in-other-window-repeatable)
+
+    (when (display-graphic-p)
+        (gk "C-M-<right>" #'emp/frame-width-double)
+        (gk "C-M-<left>"  #'emp/frame-width-half)
+        (gk "C-M-<down>"  #'emp/frame-height-double)
+        (gk "C-M-<up>"    #'emp/frame-height-half))
+
+    ;; Bury all of the buffers that we are not being used as a pager for
+    ;; (so that all of the paged buffers are together at the "top" of the
+    ;; buffer list).
+    (dolist (buf (buffer-list))
+        (with-current-buffer buf
+            (unless (emp/is-paged-buffer)
+                (bury-buffer))))
+
+    ;; Kill the scratch buffer.
+    (kill-buffer "*scratch*")
+  )
++++EOF+++
+)
+
+# The additional Emacs Lisp code that's loaded/evaluated when we're being
+# used to view a man page.
+readonly MAN_ELISP_PROLOGUE=$(cat <<'+++EOF+++'
+(progn
+    ;; Man mode custom keybindings.
+    (defun emp/man-mode-hook ()
+        (fset 'mk (lambda (k f)
+            (define-key Man-mode-map (kbd k) f)))
+        (mk "/" 'isearch-forward)
+            ;; DWIM when I hit the 'less' search key
+        ;;(mk "q" 'save-buffers-kill-emacs)
+        (mk "C-h" 'scroll-down-command)
+        (mk "<deletechar>" 'scroll-down-command)
+            ;; My Backspace key seems to be C-h, and my
+            ;; Delete key is <deletechar>
+        (mk "q" 'kill-emacs)
+            ;; default just buries the man page buffer
+        ;;(mk "Q" 'save-buffers-kill-emacs)
+        (mk "Q" 'kill-emacs))
+    (add-hook 'Man-mode-hook #'emp/man-mode-hook)
+
+    (setq Man-notify-method 'bully)
+    (setenv "MANPAGER" "cat"))
++++EOF+++
+)
+readonly MAN_ELISP_EPILOGUE=$(cat <<'+++EOF+++'
+(progn
+    (bury-buffer "*scratch*"))
++++EOF+++
+)
+
+
+# General utility functions.
+
+function debug() {
+    [ $DO_DEBUG -gt 0 ] && echo "${PROG}: $*" >&2
+    return 0
+}
+
+function inform() {
+    [ $VERBOSITY -ge $INFORM_VERBOSITY_LEVEL ] && echo "${PROG}: $*" >&2
+    return 0
+}
+
+function warn() {
+    [ $VERBOSITY -ge $WARN_VERBOSITY_LEVEL ] && echo "${PROG}: $*" >&2
+    return 0
+}
+
+# usage: die exit-code msg...
+function die() {
+    local rc=$1
+
+    shift
+    cat << +++EOF+++ >&2
+
+${PROG} failed: $*
+
++++EOF+++
+    exit $rc
+}
+
+# Causes the shell function that calls this function to output the message
+# 'msg' as a warning and then return with return code 'rc' when it's called
+# like this:
+#
+#   someCmd || return $(fail 3 "couldn't find the file '$f'.")
+#
+# or this:
+#
+#   someCmd || rc=$(fail 3 "couldn't find the file '$f'.")
+#
+# usage: fail rc msg
+function fail() {
+    #called "$@"
+    checkArgumentCount $# 2 || return 1
+
+    warn "failed in ${FUNCNAME[1]}(): $2"
+    echo $1
+
+    return 0
+}
+
+# Logs - using debug() - a call of the shell function that called us with -
+# we assume - the same arguments as were passed to us.
+#
+# usage: called "$@"
+function called() {
+    local msg="---> ${FUNCNAME[1]}"
+    local arg
+
+    for arg in "$@"
+    do
+        msg="$msg \"$arg\""
+    done
+    debug "$msg"
+}
+
+# Checks that the calling shell function (which is assumed to exist) has been
+# called with a valid number of arguments.
+#
+# Specifically, we check that 'count' is the same as 'expected-count' if
+# 'expected-max-count' is omitted, or that 'count' is at least
+# 'expected-count' and at most 'expected-max-count' otherwise. Returns 0 if
+# it is, and outputs a warning and returns non-zero if it isn't.
+#
+# usage: checkArgumentCount count expected-count [expected-max-count]
+function checkArgumentCount() {
+    local rc=0
+    local argDesc
+
+    if [ $# -lt 2 ] || [ $# -gt 3 ]
+    then
+        argDesc="arguments"
+        if [ $# -eq 1 ]
+        then
+            argDesc="argument"
+        fi
+        warn "invalid checkArgumentCount() use: $# $argDesc specified \
+instead of 2 or 3."
+        rc=1
+    else
+        if [ $1 -eq 1 ]
+        then
+            argDesc="argument"
+        else
+            argDesc="arguments"
+        fi
+
+        if [ $# -eq 2 ]
+        then
+            if [ $1 -ne $2 ]
+            then
+                warn "invalid ${FUNCNAME[1]}() use: $1 $argDesc specified \
+instead of $2."
+                rc=2
+            fi
+        else
+            if [ $1 -lt $2 ] || [ $1 -gt $3 ]
+            then
+                warn "invalid ${FUNCNAME[1]}() use: $1 $argDesc specified \
+instead of between $2 and $3 arguments."
+                rc=3
+            fi
+        fi
+    fi
+
+    return $rc
+}
+
+# Checks that the calling shell function (which is assumed to exist) has been
+# called with the minimum required number of arguments 'min-count'.
+#
+# Note: this function should only be called for functions that can take an
+# unlimited number of arguments: if the function has a maximum number of
+# arguments then it should call checkArgumentCount() instead.
+#
+# usage: checkMinimumArgumentCount count min-count
+function checkMinimumArgumentCount() {
+    local rc=0
+    local argDesc
+
+    if [ $# -ne 2 ]
+    then
+        argDesc="arguments"
+        if [ $# -eq 1 ]
+        then
+            argDesc="argument"
+        fi
+        warn "invalid checkMinimumArgumentCount() use: $# $argDesc specified \
+instead of 2."
+        rc=1
+    else
+        if [ $1 -lt $2 ]
+        then
+            argDesc="arguments"
+            if [ $1 -eq 1 ]
+            then
+                argDesc="argument"
+            fi
+            warn "invalid ${FUNCNAME[1]}() use: $1 $argDesc specified when \
+at least $2 are required."
+            rc=2
+        fi
+    fi
+
+    return $rc
+}
+
+# Checks that all of the commands named in 'cmd...' exist (presumably because
+# they're required by this script to be present). Returns 0 if they're all
+# present, and outputs one or more warnings and returns the number of
+# commands that are missing otherwise.
+#
+# Note: this is based heavily on the code found in the "Availability of
+# commands" section of http://wiki.bash-hackers.org/scripting/style.
+#
+# usage: requireCommands cmd...
+function requireCommands() {
+    local rc=0
+    local cmd
+    local missing=""
+
+    for cmd in "$@"
+    do
+        if ! hash "$cmd" >/dev/null 2>&1
+        then
+            if [ -z "$missing" ]
+            then
+                missing="$cmd"
+            else
+                missing="${missing}, $cmd"
+            fi
+            rc=$((rc+1))
+        fi
+    done
+
+    if [ $rc -eq 1 ]
+    then
+        warn "the required command '${missing}' wasn't found in your PATH."
+    elif [ $rc -gt 1 ]
+    then
+        warn "the following ${rc} required commands weren't found in your \
+PATH: ${missing}."
+    fi
+
+    return $rc
+}
+
+
+# Returns 0 iff the current shell is running under a 'screen' session.
+#
+# This is useful since starting a screen session while already running under
+# screen usually goes ... badly.
+#
+# Note: this was copied from common-aliases.sh.
+#
+# usage: is-under-screen
+function is-under-screen() {
+    checkArgumentCount $# 0 || return 1
+
+    # This was taken from the vterm_printf() defined in editor-aliases.sh.
+    [ "${TERM%%-*}" = "screen" ]
+}
+
+
+# File utility functions.
+
+# Creates a file with pathname 'dest' that is a copy of the file with
+# pathname 'src', creating any and all missing parent directories of 'dest'
+# first. Returns 0 if the file is successfully copied, and outputs a warning
+# and returns a nonzero value otherwise.
+#
+# usage: copyFile src dest
+function copyFile() {
+    #called "$@"
+    checkArgumentCount $# 2 || return 1
+    local -r src="$1"
+    local -r dest="$2"
+
+    ensureParentDirectoryExists "$dest" || \
+        return $(fail 2 "couldn't copy '$src' to '$dest' because the \
+latter's parent directory couldn't be created.")
+
+    inform "copying '$src' to '$dest'."
+    cp -a "$src" "$dest" || \
+        return $(fail 2 "couldn't copy '$src' to '$dest'.")
+
+    return 0
+}
+
+# Ensures that the directory containing the file with pathname 'f' exists if
+# it doesn't already. Returns 0 if it's successfully created or already
+# exists, and returns a nonzero value otherwise.
+#
+# usage: ensureParentDirectoryExists f
+function ensureParentDirectoryExists() {
+    local rc=0
+    local d
+
+    #called "$@"
+    checkArgumentCount $# 1 || return 1
+    d=$(dirname "$1")
+    if [ -z "$d" ]
+    then
+        d="."  # which SHOULD exist, but it's possible it doesn't
+    fi
+    mkdir -p -- "$d" || rc=1
+
+    return $rc
+}
+
+# Creates a subdirectory named 'subdir' of the directory with pathname
+# 'parent' and returns 0, or returns a non-zero value and reports an error.
+#
+# usage: createSubdirectory parent subdir
+function createSubdirectory() {
+    local rc=0
+
+    checkArgumentCount $# 2 || return 1
+    local -r d="$1/$2"
+
+    mkdir -- "$d" || \
+        rc=$(fail 2 "couldn't create the subdirectory '$1' of '$2'.")
+
+    return $rc
+}
+
+# Outputs to standard output the pathname of a temporary file that is
+# intended to be renamed to have the pathname 'path' once it has its final
+# contents. Returns 0 on success and outputs a warning and returns a
+# nonzero value otherwise.
+#
+# See also: renameTemporaryFile(), renameOrRemoveTemporaryFile().
+#
+# usage: createTemporaryFile path
+function createTemporaryFile() {
+    local rc=0
+    local d
+
+    #called "$@"
+    checkArgumentCount $# 1 || return 1
+    local -r path="$1"
+    d=$(dirname "$path")
+    if [ -z "$d" ]
+    then
+        d="."
+    fi
+
+    # Note: some versions of 'mktemp' support '-p' but NOT the corresponding
+    # long option, and some require that the pattern end in '.XXXXXX' if the
+    # pattern contains 'X''s at all.
+    local -r base=$(basename "$path")
+    mktemp -p "$d" "${PROG}-${base}.XXXXXX" || \
+        rc=$(fail 2 "couldn't create a temporary file from ${path}.")
+
+    return $rc
+}
+
+# Outputs to standard output the file extension part of the pathname 'path'.
+# Returns 0 unless we're called incorrectly.
+#
+# See also: removeExtension().
+#
+# usage fileExtension path
+function fileExtension() {
+    local rc=0
+
+    checkArgumentCount $# 1 || return 1
+
+    basename "$1" | grep '^[^\.].*[\.]' | grep -o '\.[^\.]*$' | sed 's/^.//'
+
+    return $rc
+}
+
+# Moves the contents of the directory with pathname 'srcdir' into the
+# directory with pathname 'destdir' using the 'mv' command with the options
+# 'mvOpts' (possibly in addition to others determined by this function).
+# Returns 0 if everything is moved successfully, and nonzero if not (or if
+# we're called incorrectly).
+#
+# Note: all files and directories in and under 'srcdir' are moved, including
+# ones that start with a '.'.
+#
+# usage: moveDirectoryContents mvOpts srcdir destdir
+function moveDirectoryContents() {
+    local oldIfs="$IFS"
+    local rc=0
+    local f
+
+    checkArgumentCount $# 3 || return 1
+    local -r opts="$1"
+    local -r src="$2"
+    local -r dest="$3"
+
+    # Note: we can't just use 'mv -f -- "$src"/* since that will miss files
+    # that start with '.'; also, "$src/.*" will match (and unsuccessfully
+    # try to move) the '.' and '..' directories.
+    IFS=$'\n'
+    for f in $(find "$src" -mindepth 1 -maxdepth 1)
+    do
+        #debug "pwd=[$(pwd)]"
+        mv $opts -- "$f" "$dest"
+        rc=$?
+        [ $rc -eq 0 ] || break  # for
+    done
+    IFS="$oldIfs"
+
+    return $rc
+}
+
+
+# Outputs to standard output the file extension 'ext' as a full file
+# extension: that is, as one that starts with a '.' (such as ".ogg").
+#
+# usage: fullExtension ext
+function fullExtension() {
+    local rc=0
+
+    checkArgumentCount $# 1 || return 1
+
+    printf ".${1##.*}"
+
+    return $rc
+}
+
+# Outputs to standard output 'path' with the extension 'ext' removed (if it
+# has that extension) or any file extension it has otherwise. Returns 0
+# unless we're called incorrectly.
+#
+# See also: fileExtension().
+#
+# usage removeExtension [ext] path
+function removeExtension() {
+    local rc=0
+    local ext f
+
+    checkArgumentCount $# 1 2 || return 1
+    if [ $# -eq 1 ]
+    then
+        f="$1"
+        ext="$(fileExtension "$f")"
+    else
+        ext="$1"
+        f="$2"
+    fi
+    ext="$(fullExtension "$ext")"
+
+    printf "%s/%s\n" "$(dirname "$f")" "$(basename "$f" "$ext")"
+
+    return $rc
+}
+
+# If 'rc' is zero then renames the temporary file with pathname 'tmpPath' to
+# have the pathname 'finalPath', and if 'rc' is nonzero then removes/deletes
+# the temporary file with pathname 'tmpPath'. In either case returns 0 on
+# success and outputs a warning and returns a nonzero value otherwise.
+#
+# Note: failing to delete a temporary file will NOT cause this function to
+# fail since the overall operation that it is a part of will have still
+# succeeded.
+#
+# usage: renameOrRemoveTemporaryFile rc tmpPath finalPath
+function renameOrRemoveTemporaryFile() {
+    local rc=0
+
+    #called "$@"
+    checkArgumentCount $# 3 || return 1
+
+    if [ $1 -eq 0 ]
+    then
+        renameTemporaryFile "$2" "$3"
+        rc=$?
+    else
+        deleteTemporaryFile "$2"
+        rc=$?
+    fi
+
+    return $rc
+}
+
+# Renames the temporary file with pathname 'tmpPath' to have the pathname
+# 'finalPath'. Returns 0 on success and outputs a warning and returns a
+# nonzero value otherwise.
+#
+# See also: createTemporaryFile(), renameOrRemoveTemporaryFile().
+#
+# usage: renameTemporaryFile tmpPath finalPath
+function renameTemporaryFile() {
+    local rc=0
+
+    #called "$@"
+    checkArgumentCount $# 2 || return 1
+    local -r tmpPath="$1"
+    local -r finalPath="$2"
+
+    mv -f -- "$tmpPath" "$finalPath" || \
+        rc=$(fail 2 "couldn't rename the temporary file '$tmpPath' to \
+'$finalPath'.")
+
+    # Try to remove "$tmpPath" in case it still exists. (We intentionally do
+    # NOT cause this function to report failure just because we couldn't
+    # delete a temporary file.)
+    deleteTemporaryFile "$tmpPath"
+
+    return $rc
+}
+
+# Tries to delete the temporary file with pathname 'path', outputting an
+# informational message iff it fails.
+#
+# Note: we don't return a nonzero value if we can't delete the temporary file
+# since not being able to delete a temporary file doesn't usually cause the
+# operation it's a part of to fail: it just leaves the filesystem a little
+# messier than we'd like.
+#
+# usage deleteTemporaryFile path
+function deleteTemporaryFile() {
+    #called "$@"
+    checkArgumentCount $# 1 || return 1
+
+    rm -f -- "$1" || inform "failed to delete the temporary file '$1'."
+
+    return 0
+}
+
+
+# Creates under the first directory in 'parent-dir...' that it can the
+# directory in and under which this program creates all of its working files,
+# and also sets the global WORK_DIR variable to the directory's full
+# pathname. Returns 0 on success and outputs a warning message and returns a
+# nonzero value otherwise.
+#
+# usage: createWorkingDirectory parent-dir...
+function createWorkingDirectory() {
+    local rc=0
+    local didCreate="n"
+    local parent
+
+    #called "$@"
+    if [ $# -eq 0 ]
+    then
+        warn "invalid ${FUNCNAME[0]}() use: no parent directories specified."
+        return 1
+    fi
+
+    for parent in "$@"
+    do
+        # Note: WORK_DIR is intentionally NOT local.
+        debug "trying to create working directory under '$parent'."
+        if [ $DO_DEBUG -gt 0 ]
+        then
+            WORK_DIR="${parent}/${PROG}-work-debug"
+            ${ECHOER} mkdir -- "${WORK_DIR}"
+            if [ $? -eq 0 ]
+            then
+                didCreate="y"
+                break  # for
+            fi
+        else
+            # Note: some versions of 'mktemp' support '-p' but NOT the
+            # corresponding long option, and some require that the pattern
+            # end in '.XXXXXX' if the pattern contains 'X''s at all. And
+            # using '_work' instead of '-work' in the pattern prevents the
+            # pattern from being the same as the one used in
+            # createTemporaryFile().
+            #
+            # Note: we include our PID in the directory name to make it
+            # easier to determine whether the directory is still in use
+            # (since it can get left behind due to an unexpected system
+            # shutdown, for example).
+            WORK_DIR="$(${ECHOER} mktemp -d -p "$parent" "${PROG}_$$_work.XXXXXX")"
+            if [ $? -eq 0 ]
+            then
+                didCreate="y"
+                break  # for
+            fi
+        fi
+    done
+
+    if [ "$didCreate" = "n" ]
+    then
+        if [ $DO_DEBUG -gt 0 ]
+        then
+            rc=$(fail 2 "couldn't create debug working directory \
+    ${WORK_DIR}.")
+        else
+            rc=$(fail 3 "couldn't create the working directory under \
+    ${parent}.")
+        fi
+        WORK_DIR=""  # since whatever we set it to above isn't valid
+    fi
+
+    return $rc
+}
+
+
+# Functions.
+
+# Outputs to standard error a usage message for this program/script.
+#
+# usage: usage [msg]
+function usage() {
+    if [ $# -gt 0 ]
+    then
+        cat << +++EOF+++ >&2
+
+${PROG}: $*
++++EOF+++
+    fi
+    cat << +++EOF+++ >&2
+
+usage: $PROG -h
+       $PROG -k
+       $PROG [-FgRnN] [-p pat] [-e code]... [-f fn]... [-l src-file]... [[+[line]] [@rev] file]...
+
+If the '-h' option is specified then this message is output to
+standard output and we exit with exit code 0. If the '-k'
+option is specified then a message summarizing the nonstandard
+keybindings is output to standard output and we exit with exit
+code 0.
+
+Otherwise a new Emacs is started and each 'file' - as well as
+standard input's content if it isn't a terminal - is opened for
+reading only in a separate buffer, with line number 'line' (or
+the last line if 'line' is omitted) the current line for each
+'file' preceded by '+[line]', and with the first line the
+current line for the other 'file''s. If the '-p' option was
+specified then point is then moved to the site of the first
+match for the regular expression 'pat'. For each 'file'
+preceded by '@rev' that version control revision of the file
+will be opened instead, if possible. (None, one or both of
+'@rev' and '+[line]' can be specified for a given 'file', and
+if both are then they can be specified in either order.)
+
+If a 'file' is '-' then it represents our standard input: the
+current line in its buffer will be determined by any '+line'
+that immediately precedes it. If no 'file' is '-' and our
+standard input isn't a terminal then we act as though an extra
+'file' that is '-' had been appended to our invocation (with no
+'+line' immediately preceding it).
+
+By default a terminal Emacs is started, but if the '-g' option
+is specified then a graphical Emacs is started - if possible -
+instead.
+
+The '-F', '-R' and '-N' options work like the corresponding
+options to the program 'less', the '-f' and '-l' options work
+like the corresponding options to the program 'emacs', and the
+'-e' option works like the '--eval' option to 'emacs'. The '-n'
+option exists for compatibility with 'less', but is ignored since
+it addresses a problem we don't have. Similarly, the '-i' and
+'-I' options also exist for compatibility with 'less', but are
+ignored.
+
++++EOF+++
+}
+
+
+# Outputs to standard output a summary of the nonstandard keybindings that
+# are available in Emacs instances that we start.
+#
+# usage: keysSummary
+function keysSummary() {
+# - free prefixless keys: i,v,z
+# - to replace? C
+    cat << +++EOF+++
+Keys Summary
+------------
+In most buffers the following unmodified keys all work like the
+same keys would with the 'C-' modifier in default Emacs (so for
+example 's' does what 'C-s' does in default Emacs): d, l, r, s,
+u, w.
+
+The remainder are described below. The corresponding keybinding
+in default Emacs, if any, is shown in [square brackets].
+
+  - b: ibuffer - buffers list (also 'C-x C-b' in all buffers)
+  - c: other-window [C-x o]
+  - e: open the current buffer in the main Emacs instance without waiting
+  - E: open the current buffer in the main Emacs instance and wait until that
+       instance is done with the buffer
+  - f: auto-revert-tail-mode (like 'tail -f')
+  - g: revert-buffer (and undoes keep/delete lines (k/K))
+  - h/?: describe-mode (view-mode help) [C-h m]
+  - j: jump-to-register [C-x r j]
+  - J: jump to end of buffer, or beginning if already there
+  - k/K: keep-lines/delete-matching-lines
+  - m: point-to-register [C-x r SPC]
+  - o: occur [M-s o]
+  - p/n: previous/next buffer we are a pager for
+  - P/N: prev./next compile error (or *occur* item - see 'o')
+  - C-p/C-n: previous/next buffer [C-x <left>/C-x <right>]
+  - q/Q: kill buffer/Emacs
+  - t: toggle the truncating of long lines
+  - x: exchange-point-and-mark [C-x C-x]
+
+  - S-1..S-9: save point in the register named after the unshifted digit (1-9)
+  - 1..9: jump to the point in the register named after the digit (1-9)
+  - SPC: scroll forward one page
+  - Delete, Backspace: scroll backward one page
+  - Insert: switch to other window or buffer
+  - End: delete-other-windows [C-x 1]
+  - C-M-End: delete-other-windows (same as 'End') if more than one
+    [C-x 0], to bottom of buffer otherwise [M->]
+  - C-left/C-right: left-word/right-word [C-<left>/C-<right>]
+  - C-up/C-down: backward/forward paragraph [M-{/M-}]
+  - C-home/C-end: to top/bottom of buffer [M-</M->]
+
+  - F8: go to line number
+
+  - C-x up/down: move up/down a line in the other window
+  - C-x PgUp/PgDown: move up/down a page in the other window
+  - C-x left/right: switch to the previous/next paged buffer
+  - C-x C-left/C-right: switch the the previous/next buffer
+
+The following only work in graphical Emacs:
+
+  - +,=/-: increase/decrease font size
+  - C-M-up/C-M-down: decrease/increase frame size
+  - C-M-left/C-M-right: decrease/increase frame width
+
+Most of the above bindings will work in any buffer when given
+a 'C-v' prefix. In particular, 'C-v C-v' will make view-mode
+the current buffer's major mode.
++++EOF+++
+}
+
+
+# Returns 0 iff we're only paging one non-directory file, its contents are
+# short enough to fit on the screen all at once, and our '-F' option was
+# specified; and returns nonzero otherwise.
+#
+# usage: doOutputOneScreenUnpaged
+function doOutputOneScreenUnpaged() {
+    local rc=2
+    local n max width
+
+    if [[ "${DO_QUIT_IF_ONE_SCREEN}" = "y" ]] && \
+       [[ ${NUM_INPUT_FILES} -eq 1 ]] && [ ! -d "${FILES[0]}" ]
+    then
+        debug "single file eligible for no paging if one screen ..."
+        set +u  # since LINES may be unbound
+        max="${LINES:-$(tput lines)}"
+            # Note: redirecting tput's output to /dev/null changes the value
+            # it outputs (to a standard default?).
+        [[ $? -eq 0 ]] || max=30  # reasonably conservative default
+        set -u
+        debug "max. lines for one screen : $max"
+
+        set +u  # since COLUMNS may be unbound
+        width="${COLUMNS:-$(tput cols)}"
+            # Note: redirecting tput's output to /dev/null changes the value
+            # it outputs (to a standard default?).
+        [[ $? -eq 0 ]] || width=80  # reasonably conservative default
+        set -u
+        debug "max. screen width: $width"
+
+        n=$(fold -w "$width" "${FILES[0]}" | wc -l)
+        debug "num. lines in our one input file : $n"
+
+        # We use '-lt' rather than '-le' to allow room for a 1-line prompt
+        # after our output.
+        if [[ -n "$n" ]] && [[ $n -lt $max ]]
+        then
+            rc=0
+        fi
+    fi
+
+    return $rc
+}
+
+
+# Returns 0 iff 'val' is a natural number (that is, an integer greater than
+# or equal to zero).
+#
+# usage: isNaturalNumber val
+function isNaturalNumber() {
+    [[ -n "$1" ]] && [[ -z $(echo "$1" | tr -d '[:digit:]') ]]
+}
+
+
+# Returns 0 if we only have one input file/source and it's our standard input,
+# and returns nonzero otherwise.
+#
+# usage: isStdinOnlyInput
+function isStdinOnlyInput() {
+    local rc=2
+
+    if [[ ${NUM_INPUT_FILES} -eq 1 ]] && \
+       [[ "${FILES[0]}" = "${STDIN_FILE}" ]]
+    then
+        rc=0
+    fi
+
+    return $rc
+}
+
+
+# Basic function to launch Emacs with customization mainly around the
+# `view-mode'.
+function viewWithEmacs {
+    local doShowLineNums="nil"
+    local -a files=()
+    local n i f loc
+
+    [ "$DO_SHOW_LINE_NUMBERS" = "y" ] && doShowLineNums="t"
+    set +u # since 'files' may be unbound/empty (e.g. when viewing man pages)
+    debug "NUM_INPUT_FILES = ${NUM_INPUT_FILES}"
+    for n in $(seq 1 ${NUM_INPUT_FILES} | tr '\n' ' ')
+    do
+        i=$((n-1))
+        #debug "    i : $i"
+        loc="${FILE_LOCS[$i]}"
+        #debug "    loc : $loc"
+        f="${FILES[$i]}"
+        #debug "    f : $f"
+        if [ -n "$f" ]
+        then
+            [[ "${#loc}" -gt 1 ]] && files=("${files[@]}" "$loc")
+                # 'loc' is '+line' (and not just '+': see below)
+            files=("${files[@]}" "$f")
+            if [[ "$f" = "${STDIN_FILE}" ]]
+            then
+                files=("${files[@]}" "--eval" '(progn
+                              (set-visited-file-name nil)
+                              (rename-buffer "*Stdin*" :unique)
+                            )')
+            fi
+            files=("${files[@]}" "-f" "emp/prepare-buffer")
+            [[ "${#loc}" -eq 1 ]] && \
+                files=("${files[@]}" "-f" "end-of-buffer")
+                # 'loc' is '+'
+            [[ -n "${INITIAL_SEARCH_REGEX}" ]] && files=("${files[@]}" \
+                "--eval" "(emp/to-initial-regexp \"${INITIAL_SEARCH_REGEX}\")")
+        fi  # if [ -n "$f" ]
+        # Otherwise the pathname is the empty string, so omit it.
+    done
+    debug "files part of emacs cmd : ${files[*]}"
+
+    # Notes:
+    # - we set the Emacs default-directory to be the one where this script
+    #   was launched from (which is useful during 'C-x C-f', among other
+    #   things)
+    # - we intentionally don't 'exec' Emacs since we need this script to
+    #   stick around to delete our WORK_DIR and everything in it
+    debug "args passed to viewWithEmacs : $*"
+    if [ "$USE_INIT_FILES" = "y" ]
+    then
+        early="$WORK_DIR/prologue.el"
+        echo "$ELISP_PROLOGUE" > "$early"
+        late="$WORK_DIR/epilogue.el"
+        echo '(setq display-line-numbers '${doShowLineNums}')' > "$late"
+        echo '(setq default-directory "'"$(pwd)"'/")' >> "$late"
+        echo "$ELISP_MIDDLE" >> "$late"
+        echo '(when '"${DO_CONVERT_ANSI_CODES}"'
+              (let ((inhibit-read-only t))  ;; ignore read-only status of buffer
+                  (require (quote ansi-color))
+                  (ansi-color-apply-on-region (point-min) (point-max))))' >> "$late"
+        echo "$ELISP_EPILOGUE" >> "$late"
+        #cat >&2 << +++EOF+++
+        emacs -Q "$@" -l "$early" "${files[@]}" \
+              -l "$late" 2>/dev/null </dev/tty
+#+++EOF+++
+    else
+        #cat >&2 << +++EOF+++
+        emacs -Q "$@" --eval "$ELISP_PROLOGUE" "${files[@]}" \
+          --eval '(setq display-line-numbers '${doShowLineNums}')' \
+          --eval '(setq default-directory "'"$(pwd)"'/")' \
+          --eval "$ELISP_MIDDLE" \
+          --eval '(when '"${DO_CONVERT_ANSI_CODES}"'
+              (let ((inhibit-read-only t))  ;; ignore read-only status of buffer
+                  (require (quote ansi-color))
+                  (ansi-color-apply-on-region (point-min) (point-max))))' \
+          --eval "$ELISP_EPILOGUE" 2>/dev/null </dev/tty
+#+++EOF+++
+    fi
+    set -u  # now that we're done with 'files'.
+}
+
+
+# Outputs to standard output the topic of the man page contained in the file
+# with pathname 'file', or outputs nothing if the file doesn't appear to
+# contain a man page.
+#
+# usage: manPageTopic file
+function manPageTopic() {
+    local res
+
+    # Parse the first line of 'file' to see whether it's a man page.
+    res=$(head -n 1 "$1")
+    debug "first line of possible man page = $res"
+
+    # The first line of man pages is assumed to be
+    #   FOO(1)  optional something something FOO(1)
+    # It is not mandatory for the below grep to always pass, so OR it with
+    # "true" so that "set -e" does not kill the script at this point.
+    res="$(echo "$res"|grep -Po '^([A-Za-z]+\([0-9]+\))(?=\s+.*?\1$)' || true)"
+    [[ -z "$res" ]] || echo "$res"
+}
+
+
+# Views this program's input: either the contents of the specified files or
+# the data from its standard input.
+#
+# usage: viewInput
+function viewInput() {
+    local cmd=""
+
+    # Set 'cmd' iff we look to be the pager for the 'man' command.
+    if isStdinOnlyInput
+    then
+        local -r topic=$(manPageTopic "${STDIN_FILE}")
+        if [[ -n "${topic}" ]]
+        then
+            # Piped input is a man page. (This usually happens by setting the
+            # PAGER or MANPAGER environment variable to this script and then
+            # executing something like 'man grep'.)
+            #
+            # Note: if we don't reset MANPAGER then the shell command that
+            # the Emacs 'man' function executes will try to use this script,
+            # which isn't what we want (though no infinite loops occur or
+            # anything).
+            #
+            # Note: we don't end up setting 'Man-notify-method' because if we
+            # don't delete the scratch buffer then we have to type 'q' twice
+            # to exit instead of once. Which is pretty minor, but still a
+            # little annoying. And if we set 'Man-notify-method' to a value
+            # that makes the man page the current window then that's the one
+            # that gets deleted instead of the scratch buffer.
+            #
+            # Note: we intentionally ignore DO_SHOW_LINE_NUMBERS here.
+            debug "man page topic = ${topic}"
+            FILES=()      # remove STDIN_FILE ...
+            debug "man - # files : ${#FILES[@]}"
+            FILE_LOCS=()  # ... and its associated location
+            if [ "$USE_INIT_FILES" = "y" ]
+            then
+                f="$WORK_DIR/man-custom.el"
+                echo "$MAN_ELISP_PROLOGUE" > "$f"
+                echo '(man (downcase "'"${topic}"'"))' >> "$f"
+                echo "$MAN_ELISP_EPILOGUE" >> "$f"
+                cmd="viewWithEmacs ${EMACS_ARGS[*]} -l '$f'"
+            else
+                cmd="viewWithEmacs ${EMACS_ARGS[*]} \
+                     --eval '$MAN_ELISP_PROLOGUE' \
+                     --eval '(man (downcase \"${topic}\"))' \
+                     --eval '$MAN_ELISP_EPILOGUE'"
+            fi
+        fi  # if [[ -n "${topic}" ]]
+    fi
+
+    if [[ -z "$cmd" ]]
+    then
+        # empager foo.txt
+        # cat foo.txt | empager
+        # cat foo.txt | empager bar.txt, etc.
+        cmd="viewWithEmacs ${EMACS_ARGS[*]}"
+    fi
+    debug "command : $cmd"
+    eval "$cmd"
+}
+
+
+# Creates a file with pathname 'destPath' whose contents are the revision of
+# the file in the current working directory with basename 'srcBase' indicated
+# by the revision ID 'revId'. Returns 0 if the file is successfully created,
+# 1 if we're called incorrectly and a value greater than 1 otherwise. A
+# warning message will also have been output iff we return a nonzero value.
+#
+# Note: the exact format of 'revId' is specific to the version control
+# system that the file with basename 'srcBase' is managed by.
+#
+# Note: currently we will only succeed on files managed by the CVS or git
+# version control programs.
+#
+# See also: createRevisionFile().
+#
+# usage: createRevisionFileFromSrcDir destPath srcBase revId
+function createRevisionFileFromSrcDir() {
+    local destPath srcBase revId d b vcName
+    local didTry="n"
+    local rc=0
+
+    checkArgumentCount $# 3 || return 1
+    destPath="$1"
+    srcBase="$2"
+    revId="$3"
+
+    vc="git"  # our default
+    if cvs ls 2>/dev/null | grep -Fxq "$srcBase"
+    then
+        vc="CVS"
+        if [[ -n "$(cvs log -lSR -r"$revId" "$srcBase")" ]]
+        then
+            didTry="y"
+            cvs update -r "$revId" -p "$srcBase" > "$destPath" # 2>/dev/null
+            rc=$?
+        else
+            warn "there's no revision '$revId' of the file '$srcBase' in $vc."
+            rc=4
+        fi
+    else
+        # From: https://devtip.in/610208/how-to-retrieve-a-single-file-from-a-specific-revision-in-git
+        didTry="y"
+        git show "${revId}:./${srcBase}" > "$destPath" # 2>/dev/null
+        rc=$?
+    fi
+
+    # Double-check that 'destPath' did indeed get created. (We don't
+    # check that it isn't empty since the file's contents could
+    # legitimately be empty.)
+    if [[ "$didTry" = "y" ]] && [[ ! -e "$destPath" ]]
+    then
+        warn "the file containing revision '$revId' of '$srcBase' should have been created but wasn't."
+        rc=3
+    fi
+
+    if [[ $rc -ne 0 ]]
+    then
+        # Ensure we only return 1 when we're called incorrectly.
+        [[ $rc -eq 1 ]] && rc=2
+
+        [[ $didTry = "y" ]] && \
+            warn "extracting revision '$revId' of the file '$srcBase' from $vc failed."
+    fi
+
+    return $rc
+}
+
+
+# Creates a file with pathname 'destPath' whose contents are the revision of
+# the file with pathname 'srcPath' indicated by the revision ID 'revId'.
+# Returns 0 if the file is successfully created, 1 if we're called
+# incorrectly and a value greater than 1 otherwise. A warning message will
+# also have been output iff we return a nonzero value.
+#
+# Note: the exact format of 'revId' is specific to the version control
+# system that the file with pathname 'srcPath' is managed by.
+#
+# See also: createRevisionFileFromSrcDir().
+#
+# usage: createRevisionFile destPath srcPath revId
+function createRevisionFile() {
+    local destPath srcPath revId d b
+    local rc=0
+
+    checkArgumentCount $# 3 || return 1
+    destPath="$1"
+    srcPath="$2"
+    revId="$3"
+
+    if [[ -e "$destPath" ]]
+    then
+        warn "refusing to create the file '$destPath' since it already exists."
+        rc=2
+    elif [[ ! -e "$srcPath" ]]
+    then
+        warn "the file '${srcPath}' to get revision '${revId}' from doesn't exist."
+        rc=3
+    elif [[ ! -r "$srcPath" ]]
+    then
+        warn "the file '${srcPath}' to get revision '${revId}' from isn't readable."
+        rc=4
+    fi
+
+    if [[ $rc -eq 0 ]]
+    then
+        d=$(dirname "$srcPath")
+        b=$(basename "$srcPath")
+        (cd "$d" && createRevisionFileFromSrcDir "$destPath" "$b" "$revId")
+        rc=$?
+    fi
+
+    return $rc
+}
+
+
+# The function that will be called when this program exits (normally or
+# otherwise, assuming it has a chance to clean up).
+#
+# Note: this function should usually only be called in a trap statement.
+#
+# usage: destructor
+function destructor() {
+    # Delete our working directory and everything in and under it unless
+    # we're debugging.
+    if [ -n "$WORK_DIR" ]
+    then
+        [ $DO_DEBUG -ne 0 ] || rm -rf "$WORK_DIR"
+    fi
+
+    # Try to delete the other temporary files that Emacs seems to create on
+    # its own (but don't report an error if it fails - e.g. if someone else
+    # owns the temporary files and so we can't delete them).
+    rm -f -- "${TEMP_DIR}/#%2AStdin%2A#"* 2>/dev/null
+}
+
+
+# Argument processing.
+
+# This is here rather than at the start of the main part of this script since
+# we may create the STDIN_FILE file as part of processing our arguments,
+# which destructor() is responsible for deleting when we're done.
+trap destructor INT QUIT TERM EXIT
+
+
+OPTS_STRING=":e:f:FgiIl:nNp:R"
+    # no help options allowed in EMPAGER: added below
+readonly NON_GUI_OPT="-nw"
+EMACS_ARGS=("${NON_GUI_OPT}")  # run terminal Emacs by default
+#EMACS_ARGS=("${NON_GUI_OPT}" "--debug-init")  # run terminal Emacs by default
+DO_CONVERT_ANSI_CODES="nil"
+    # don't try to convert ANSI codes to colors by default
+DO_QUIT_IF_ONE_SCREEN="n"
+DO_SHOW_LINE_NUMBERS="n"
+
+# Parse options from the EMPAGER environment variable, if it's been set (and
+# exported).
+set +u  # since EMPAGER may not be set
+if [[ -n "$EMPAGER" ]]
+then
+    OPTIND=1
+    while getopts "$OPTS_STRING" opt "$EMPAGER"
+    do
+        debug "EMPAGER opt : $opt"
+        case "$opt" in
+            e)
+                EMACS_ARGS=("${EMACS_ARGS[@]}" "--eval" "${OPTARG}")
+                ;;
+            f)
+                EMACS_ARGS=("${EMACS_ARGS[@]}" "-f" "${OPTARG}")
+                ;;
+            F)
+                DO_QUIT_IF_ONE_SCREEN="y"
+                ;;
+            g)
+                # Delete the ${NON_GUI_OPT} from ${EMACS_ARGS[@]} array if
+                # the '-g' option was specified.
+                # http://stackoverflow.com/a/16861932/1219634
+                EMACS_ARGS=("${EMACS_ARGS[@]/${NON_GUI_OPT}}")
+                ;;
+            i)
+                # This option is ignored: it exists for compatibility with
+                # 'less'.
+                ;;
+            I)
+                # This option is ignored: it exists for compatibility with
+                # 'less'.
+                ;;
+            l)
+                EMACS_ARGS=("${EMACS_ARGS[@]}" "-l" "${OPTARG}")
+                ;;
+            n)
+                # This option is ignored: it exists for compatibility with
+                # 'less'.
+                ;;
+            N)
+                DO_SHOW_LINE_NUMBERS="y"
+                ;;
+            p)
+                INITIAL_SEARCH_REGEX="${OPTARG}"
+                ;;
+            R)
+                DO_CONVERT_ANSI_CODES="t"
+                ;;
+            ?)
+                usage "invalid option in EMPAGER: -${OPTARG}."
+                exit 1
+                ;;
+        esac
+    done
+fi
+set -u
+
+# Parse options from the command line.
+OPTS_STRING="${OPTS_STRING}hk"
+OPTIND=1
+while getopts "$OPTS_STRING" opt
+do
+    debug "command line opt : $opt"
+    case "$opt" in
+        e)
+            EMACS_ARGS=("${EMACS_ARGS[@]}" "--eval" "${OPTARG}")
+            ;;
+        f)
+            EMACS_ARGS=("${EMACS_ARGS[@]}" "-f" "${OPTARG}")
+            ;;
+        F)
+            DO_QUIT_IF_ONE_SCREEN="y"
+            ;;
+        g)
+            # Delete the ${NON_GUI_OPT} from ${EMACS_ARGS[@]} array if the
+            # '-g' option was specified.
+            # http://stackoverflow.com/a/16861932/1219634
+            EMACS_ARGS=("${EMACS_ARGS[@]/${NON_GUI_OPT}}")
+            ;;
+        h)
+            usage 2>&1
+            exit 0
+            ;;
+        i)
+            # This option is ignored: it exists for compatibility with
+            # 'less'.
+            ;;
+        I)
+            # This option is ignored: it exists for compatibility with
+            # 'less'.
+            ;;
+        k)
+            keysSummary | "${PAGER:-$PROG}"
+            exit 0
+            ;;
+        l)
+            EMACS_ARGS=("${EMACS_ARGS[@]}" "-l" "${OPTARG}")
+            ;;
+        n)
+            # This option is ignored: it exists for compatibility with 'less'.
+            ;;
+        N)
+            DO_SHOW_LINE_NUMBERS="y"
+            ;;
+        p)
+            INITIAL_SEARCH_REGEX="${OPTARG}"
+            ;;
+        R)
+            DO_CONVERT_ANSI_CODES="t"
+            ;;
+        ?)
+            usage "invalid option: -${OPTARG}."
+            exit 1
+            ;;
+    esac
+done
+shift $((OPTIND-1))
+
+trap "destructor; exit" INT QUIT TERM EXIT
+
+rc=0
+
+# Note: this sets WORK_DIR to the pathname of the working directory too.
+createWorkingDirectory "$TEMP_DIR" || exit 3
+[ $DO_DEBUG -eq 0 ] || \
+    inform "when you're done delete ${WORK_DIR}/ and everything under it!!"
+
+# Determine input/output sources/destinations.
+IS_INPUT_TTY="y"
+STDIN_FILE=""
+if ! [[ -t 0 ]]
+then
+    # Note: some versions of 'mktemp' support '-p' but NOT the corresponding
+    # long option, and some require that the pattern end in '.XXXXXX' if the
+    # pattern contains 'X''s at all.
+    IS_INPUT_TTY="n"
+    STDIN_FILE="$WORK_DIR/stdin-$USER.$$"
+    #STDIN_FILE="$(mktemp empager-stdin-"$USER.$$".XXXXXX -p $TEMP_DIR)"
+        # https://github.com/koalaman/shellcheck/wiki/SC2086
+    debug "Stdin (Temp) File : $STDIN_FILE"
+
+    #cat >| "$STDIN_FILE"
+    cp -f /dev/stdin "$STDIN_FILE"
+    if [[ -s "$STDIN_FILE" ]]
+    then
+        # I'm not sure why, but it appears that lastChar will be the empty
+        # string (and not "\n") iff STDIN_FILE ends with a newline.
+        lastChar=$(tail -c 1 "$STDIN_FILE")
+        debug "last stdin char=[$lastChar]"
+        if [[ -n "$lastChar" ]]
+        then
+            # Stdin isn't empty and doesn't end with a newline, so add one.
+            echo >> "$STDIN_FILE"
+        fi
+    fi
+fi
+
+IS_OUTPUT_TTY="n"
+[[ -t 1 ]] && IS_OUTPUT_TTY="y"
+
+# Parse non-option arguments.
+#
+# Note: these are assumed to be file pathnames - with '-' representing stdin -
+# each optionally preceded by arguments of the form '+line' and/or '@rev'
+# (where 'rev' is a revision identifier used by the version control program
+# that the file is (presumably) managed by).
+#
+# Note: FILES and FILE_LOCS should always contain the same number of items.
+# The corresponding item in FILE_LOCS is an empty string iff no location was
+# specified for a file in FILES.
+IS_EXPLICIT_STDIN="n"
+CURR_LOC=""
+CURR_REV=""
+declare -a FILE_LOCS=()
+declare -a FILES=()
+debug "initial # files : ${#FILES[@]}"
+set +u  # allow FILES and FILE_LOCS to be unset while we initialize them
+for arg in "$@"
+do
+    debug "arg : $arg"
+    case "$arg" in
+        +*)
+            # Note: '+' is handled specially in viewWithEmacs().
+            # TODO: allow +line:column too!!!!
+            if [[ "$arg" = "+" ]] || isNaturalNumber "${arg:1}"
+            then
+                CURR_LOC="$arg"
+            else
+                warn "ignoring invalid line number '${arg:1}'."
+            fi
+            ;;
+        @*)
+            if [[ "$arg" = "@" ]]
+            then
+                warn "ignoring invalid revision selector '$arg'."
+            else
+                CURR_REV="${arg:1}"
+            fi
+            ;;
+        -)
+            IS_EXPLICIT_STDIN="y"
+            if [[ -n "$CURR_REV" ]]
+            then
+                # Since standard input can't be version controlled ...
+                warn "ignoring the revision '$CURR_REV' for standard input."
+                CURR_REV=""
+            fi
+            if [[ -z "${STDIN_FILE}" ]]
+            then
+                warn "ignoring file '-' since our standard input is a terminal."
+            else
+                FILE_LOCS=("${FILE_LOCS[@]}" "${CURR_LOC}")
+                FILES=("${FILES[@]}" "${STDIN_FILE}")
+            fi
+            CURR_LOC=""
+            ;;
+        *)
+            if [[ ! -e "$arg" ]]
+            then
+                warn "ignoring nonexistent file '$arg'."
+            else
+                FILE_LOCS=("${FILE_LOCS[@]}" "${CURR_LOC}")
+                if [[ -n "$CURR_REV" ]]
+                then
+                    revFile="$(echo "$arg" | sed 's_/_|_g')-${CURR_REV}"
+                    revFile="${WORK_DIR}/${revFile}"
+                    if createRevisionFile "$revFile" "$arg" "$CURR_REV"
+                    then
+                        arg="$revFile"
+                    else
+                        warn "viewing the current version of '$arg' instead since we couldn't find or extract revision '$CURR_REV' of it."
+                    fi
+                    CURR_REV=""
+                fi
+                FILES=("${FILES[@]}" "$arg")
+                CURR_LOC=""
+            fi
+            ;;
+    esac
+done
+
+# If we have input on standard input and either the last argument is a
+# '+line' argument or the standard input wasn't specified (using '-' as a
+# pathname) at least once on the command line then add items for the standard
+# input to the ends of FILES and FILE_LOCS.
+debug "last loc : $CURR_LOC"
+debug "stdin file : ${STDIN_FILE}"
+debug "was stdin explicitly mentioned? ${IS_EXPLICIT_STDIN}"
+if [[ -n "${STDIN_FILE}" ]]
+then
+    if [[ "${IS_EXPLICIT_STDIN}" = "n" ]] || [[ -n "${CURR_LOC}" ]]
+    then
+        debug "added stdin to end of files (loc = ${CURR_LOC})."
+        FILE_LOCS=("${FILE_LOCS[@]}" "${CURR_LOC}")
+        FILES=("${FILES[@]}" "${STDIN_FILE}")
+    fi
+fi
+
+readonly NUM_INPUT_FILES="${#FILES[@]}"
+debug "number of input files : ${NUM_INPUT_FILES}"
+debug "input file locs : ${FILE_LOCS[@]}"
+debug "input files : ${FILES[@]}"
+# for loc in "${FILE_LOCS[@]}"
+# do
+#     debug "    file loc : $loc"
+# done
+# for f in "${FILES[@]}"
+# do
+#     debug "    file : $f"
+# done
+set -u  # disallow unset vars again now that FILE_LOCS and FILES are set
+
+
+# Main program.
+
+debug "Raw Args      : $*" # https://github.com/koalaman/shellcheck/wiki/SC2145
+debug "Emacs Args    : ${EMACS_ARGS[*]}"
+
+rc=0
+
+requireCommands cat cp emacs fold grep head mktemp rm seq tr wc || exit 2
+
+CAT_OPTS=""
+[ "${DO_SHOW_LINE_NUMBERS}" = "y" ] && CAT_OPTS="${CAT_OPTS} -n"
+if [ ${NUM_INPUT_FILES} -eq 0 ]
+then
+    warn "no input - files or standard input - to page."
+    rc=2
+elif [[ "${IS_OUTPUT_TTY}" = "n" ]]
+then
+    # Our output isn't a terminal, so don't page our input, just pass it
+    # through.
+    #
+    # Note: this is also how 'less' behaves, and can be useful when we're
+    # used in another program that's usually used interactively, but whose
+    # output can also be postprocessed: for example, a shell alias like
+    #
+    #   alias ll='ls -l | empager'
+    #
+    # e.g. empager foo.txt | grep bar
+    cat ${CAT_OPTS} "${FILES[@]}"
+elif doOutputOneScreenUnpaged
+then
+    # We're only paging one file (possibly stdin), its contents are short
+    # enough to fit entirely on the screen, and our '-F' option was
+    # specified.
+    cat ${CAT_OPTS} "${FILES[@]}"
+else
+    viewInput
+    rc=$?
+
+    # We only exit with exit code 1 when we're called incorrectly.
+    [[ $rc -eq 1 ]] && rc=2
+fi
+
+exit $rc
+
+# References:
+#  http://superuser.com/a/843744/209371
+#  http://stackoverflow.com/a/15330784/1219634 - /dev/stdin (Kept just for
+#    reference, not using this in this script any more.)
+#  https://github.com/dj08/utils-generic/blob/master/eless
